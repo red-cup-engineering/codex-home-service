@@ -7,12 +7,13 @@ Keeps a Codex home sound from one parameter record:
 - the folder Codex's thread search reads holds only live threads (idle ones archived through Codex, unlisted legacy logs moved aside)
 - generated workspace paths stay out of git's untracked set
 - disabled plugin MCP servers stay off
+- agent scratch roots lose entries unchanged past an idle limit, never ones open, mounted, kept or holding unpushed work
 
 A user timer runs retention daily. Node built-ins only.
 
 ```sh
 node scripts/codex-home.mjs plan  --parameters=<codex-home.json>    # read-only; exit 0 converged, 2 drift
-node scripts/codex-home.mjs apply --parameters=<codex-home.json>    # idempotent; --scope=placement|retention|workspace|config|timer
+node scripts/codex-home.mjs apply --parameters=<codex-home.json>    # idempotent; --scope=placement|retention|scratch|workspace|config|timer[,...]
 ```
 
 `plan` is the health check. It reads sizes, links and small files only. It never walks a workspace or greps logs, because on a loaded WSL host that is the load being diagnosed.

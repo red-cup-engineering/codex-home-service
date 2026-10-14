@@ -28,8 +28,9 @@ Each requirement has one shall. Identifiers are stable.
 - CH-4. The service shall keep the folder the Codex app searches to the threads the app lists that have been active within the record's idle limit, archiving the others with Codex's own `archive` command so they stay recoverable.
 - CH-5. The service shall move conversation files that the app's thread database does not reference, and that are older than one day, out of the searched folder into the record's legacy folder, deleting nothing.
 - CH-6. The service shall keep each declared workspace's generated paths out of git's untracked set through a managed block in that repository's `.git/info/exclude`.
-- CH-7. The service shall run CH-4 and CH-5 on a schedule from the record, so the bound holds without a person or agent remembering it.
+- CH-7. The service shall run CH-4, CH-5 and CH-16 on a schedule from the record, so the bound holds without a person or agent remembering it.
 - CH-15. For each declared workspace with `gitMaintenance`, the service shall keep git's own scheduled maintenance enabled and its multi-pack index covering all but the record's `maxUncoveredPacks` packs, because every agent git command searches each uncovered pack. Measured 2026-10-14 on 262 packs with a stale index: `git log -n 20000` took 2.19 s, and 0.11 s after `git multi-pack-index write`. Maintenance had been configured but never scheduled.
+- CH-16. For each scratch root the record declares, the service shall remove every top-level entry in which nothing has changed for the record's `idleDays`, unless the record keeps it, a process has it open, a filesystem is mounted inside it, or a git checkout inside it has uncommitted changes or commits on no remote; and it shall prune the worktree registrations the removal leaves. Measured 2026-10-14: `~/.cache/561-group` held about 50 GB in 21 entries with no owner or expiry, 27 GB of it unchanged since 10-07..10-09, and the workspace's `.codex/worktrees` held 131 agent worktrees of which git still listed 35. The owner approved a 7-day limit the same day.
 
 ## Configuration
 
@@ -37,7 +38,7 @@ Each requirement has one shall. Identifiers are stable.
 
 ## Observation and repair
 
-- CH-9. When asked to plan, the service shall change nothing, shall not walk any tree larger than the searched folder's directory listing, and shall report each item as current or drift with its measured size.
+- CH-9. When asked to plan, the service shall change nothing, shall not walk any tree larger than the searched folder's directory listing, and shall report each item as current or drift with its measured size. CH-16's idle check is the one bounded exception: it reads directory metadata in each scratch entry to a fixed depth and stops at the first change inside the idle window.
 - CH-10. When asked to apply, the service shall change only items not current, so a second apply changes nothing.
 - CH-11. The service shall carry no host, user, path, size or brand in its code; every particular shall come from the parameter record.
 - CH-12. The service shall run on Node's built-in modules alone.

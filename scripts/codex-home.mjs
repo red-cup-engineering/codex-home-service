@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // codex-home plan  --parameters=<codex-home.json>
-// codex-home apply --parameters=<codex-home.json> [--scope=all|placement|retention|workspace|config|timer]
+// codex-home apply --parameters=<codex-home.json> [--scope=all|placement|retention|scratch|workspace|config|timer[,...]]
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { loadRecord, observe, apply } from '../src/codex-home.mjs';
@@ -8,7 +8,7 @@ import { loadRecord, observe, apply } from '../src/codex-home.mjs';
 const [cmd, ...rest] = process.argv.slice(2);
 const opt = Object.fromEntries(rest.filter((a) => a.startsWith('--')).map((a) => a.slice(2).split('=')));
 if (!['plan', 'apply'].includes(cmd) || !opt.parameters) {
-  console.error('usage: codex-home plan|apply --parameters=<codex-home.json> [--scope=all|placement|retention|workspace|config|timer]');
+  console.error('usage: codex-home plan|apply --parameters=<codex-home.json> [--scope=all|placement|retention|scratch|workspace|config|timer[,...]]');
   process.exit(64);
 }
 const parameters = resolve(opt.parameters);

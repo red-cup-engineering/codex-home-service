@@ -1,10 +1,11 @@
 // Codex home service: keeps a Codex home's placement, login link, searched data, workspace scans and plugin
-// servers bounded, from one parameter record (specifications/requirements.md, CH-1..CH-13). Node built-ins only.
+// servers and agent scratch bounded, from one parameter record (specifications/requirements.md, CH-1..CH-16).
+// Node built-ins only.
 import {
   readFileSync, writeFileSync, existsSync, lstatSync, statSync, readdirSync, mkdirSync, renameSync,
   copyFileSync, mkdtempSync, rmSync, readlinkSync, symlinkSync,
 } from 'node:fs';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname, relative, resolve } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 
@@ -85,16 +86,29 @@ export function selectLegacy(files, referenced, nowMs) {
   return files.filter((f) => !referenced.has(f.path) && nowMs - f.mtimeMs > DAY_MS);
 }
 
+/** CH-16: one scratch entry's fate from what the host observers measured. Returns { expire, reason }. */
+export function decideScratch(e) {
+  if (e.declaredKeep) return { expire: false, reason: 'kept by the record' };
+  if (e.mount) return { expire: false, reason: 'a filesystem is mounted inside' };
+  if (e.inUse) return { expire: false, reason: 'open in a running process' };
+  if (!e.activity.complete) return { expire: false, reason: 'too large to prove idle' };
+  if (e.activity.recent) return { expire: false, reason: 'active' };
+  const held = e.checkouts.find((c) => !c.ok);
+  if (held) return { expire: false, reason: `${held.reason} in ${held.path}` };
+  return { expire: true, reason: `unchanged since ${new Date(e.activity.newestMs).toISOString().slice(0, 10)}` };
+}
+
 export function renderTimerUnits(record, script, parameters) {
   const r = record.retention;
+  const scopes = record.scratch ? 'retention,scratch' : 'retention';
   return {
     service: [
       '[Unit]',
-      'Description=Codex home retention (codex-home-service): archive idle threads, move legacy logs',
+      `Description=Codex home retention (codex-home-service): archive idle threads, move legacy logs${record.scratch ? ', expire idle agent scratch' : ''}`,
       '',
       '[Service]',
       'Type=oneshot',
-      `ExecStart=${record.node} ${script} apply --scope=retention --parameters=${parameters}`,
+      `ExecStart=${record.node} ${script} apply --scope=${scopes} --parameters=${parameters}`,
       'Nice=19',
       'IOSchedulingClass=idle',
       '',
@@ -215,6 +229,101 @@ function installPlan(record, { script, parameters }) {
 }
 const MB = (b) => `${(b / 1e6).toFixed(0)} MB`;
 
+// ---------- CH-16 agent scratch ----------
+const SCRATCH_DEPTH = 8;
+const SCRATCH_DIR_LIMIT = 100_000;
+
+/** The git directory a `.git` entry names: itself, or the target of a `gitdir:` file (null when that is gone). */
+function gitDirOf(dotGit) {
+  const st = lstatOrNull(dotGit);
+  if (!st?.isFile()) return st ? dotGit : null;
+  const m = /^gitdir: (.+)$/m.exec(readText(dotGit));
+  const dir = m ? resolve(dirname(dotGit), m[1].trim()) : null;
+  return dir && existsSync(dir) ? dir : null;
+}
+
+/**
+ * Newest change in a scratch entry: directory mtimes (they move on every create, delete and rename), the entry's
+ * own files, and each checkout's index and HEAD log (they move on every stage, commit and checkout), to
+ * SCRATCH_DEPTH levels. Stops at the first change after `cutoffMs`, so an active entry costs a few reads (CH-9).
+ */
+export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimit = SCRATCH_DIR_LIMIT } = {}) {
+  const st = lstatSync(path);
+  let newest = st.mtimeMs, seen = 0;
+  const repos = [];
+  const done = (complete) => ({ newestMs: newest, recent: newest > cutoffMs, complete, repos });
+  if (!st.isDirectory()) return done(true);
+  const queue = [[path, 0]];
+  for (let i = 0; i < queue.length; i++) {
+    if (newest > cutoffMs) return done(true);
+    const [dir, level] = queue[i];
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.name === '.git') {
+        repos.push(dir);
+        const g = gitDirOf(p);
+        if (g) for (const f of ['index', 'HEAD', join('logs', 'HEAD')]) newest = Math.max(newest, lstatOrNull(join(g, f))?.mtimeMs ?? 0);
+      } else if (e.isDirectory()) {
+        newest = Math.max(newest, lstatOrNull(p)?.mtimeMs ?? 0);
+        if (++seen > dirLimit) return done(false);
+        if (level + 1 < depth) queue.push([p, level + 1]);
+      } else if (level === 0) {
+        newest = Math.max(newest, lstatOrNull(p)?.mtimeMs ?? 0);
+      }
+    }
+  }
+  return done(true);
+}
+
+/** A git checkout in scratch may go only when clean and with every commit on a remote (CH-16). */
+export function checkoutState(root) {
+  const dotGit = join(root, '.git');
+  const gitdir = gitDirOf(dotGit);
+  if (!gitdir) return { path: root, ok: true, reason: 'git metadata already gone', common: null };
+  const common = existsSync(join(gitdir, 'commondir')) ? resolve(gitdir, readText(join(gitdir, 'commondir')).trim()) : gitdir;
+  const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  try {
+    if (git('status', '--porcelain', '--untracked-files=normal')) return { path: root, ok: false, reason: 'uncommitted changes', common };
+    if (git('rev-list', '-n', '1', 'HEAD', '--not', '--remotes')) return { path: root, ok: false, reason: 'commits on no remote', common };
+  } catch { return { path: root, ok: false, reason: 'unreadable checkout', common }; }
+  return { path: root, ok: true, reason: 'clean and pushed', common };
+}
+
+function openPaths() {
+  const out = [];
+  for (const pid of readdirSync('/proc')) {
+    if (!/^\d+$/.test(pid)) continue;
+    try { out.push(readlinkSync(`/proc/${pid}/cwd`)); } catch { /* gone or not ours */ }
+    let fds = [];
+    try { fds = readdirSync(`/proc/${pid}/fd`); } catch { /* gone or not ours */ }
+    for (const fd of fds) { try { out.push(readlinkSync(`/proc/${pid}/fd/${fd}`)); } catch { /* closed */ } }
+  }
+  return out;
+}
+const mountPoints = () => readText('/proc/self/mountinfo').split('\n').map((l) => l.split(' ')[4]).filter(Boolean);
+const under = (paths, p) => paths.some((x) => x === p || x.startsWith(`${p}/`));
+
+/** Every top-level entry under each scratch root, measured and decided (CH-16). */
+export function observeScratch(record, now = Date.now()) {
+  const s = record.scratch;
+  if (!s) return [];
+  const cutoffMs = now - s.idleDays * DAY_MS;
+  const open = openPaths(), mounts = mountPoints();
+  return s.roots.flatMap((root) => (existsSync(root.path) ? readdirSync(root.path) : []).map((name) => {
+    const path = join(root.path, name);
+    const e = { root: root.path, name, path, declaredKeep: (root.keep ?? []).includes(name), mount: under(mounts, path), inUse: under(open, path) };
+    let activity = { newestMs: 0, recent: false, complete: true, repos: [] }, checkouts = [];
+    if (!e.declaredKeep && !e.mount && !e.inUse) {
+      activity = scratchActivity(path, cutoffMs);
+      if (activity.complete && !activity.recent) checkouts = activity.repos.map(checkoutState);
+    }
+    const full = { ...e, activity, checkouts };
+    return { ...full, ...decideScratch(full) };
+  }));
+}
+
 export async function observe(record, { script, parameters }) {
   const items = [];
   const add = (id, ok, detail) => items.push({ id, status: ok ? 'current' : 'drift', detail });
@@ -250,6 +359,22 @@ export async function observe(record, { script, parameters }) {
     }
   }
 
+  if (record.scratch) {
+    const entries = observeScratch(record, now);
+    for (const root of record.scratch.roots) {
+      const mine = entries.filter((x) => x.root === root.path);
+      const expired = mine.filter((x) => x.expire);
+      const kept = Object.entries(mine.filter((x) => !x.expire).reduce((m, x) => {
+        const k = x.reason.replace(/ in \/.*$/, '');
+        m[k] = (m[k] ?? 0) + 1;
+        return m;
+      }, {})).map(([k, n]) => `${n} ${k}`).join(', ');
+      const names = expired.slice(0, 6).map((x) => x.name).join(', ') + (expired.length > 6 ? ', ...' : '');
+      add(`CH-16 scratch ${root.path}`, expired.length === 0,
+        `${expired.length} unchanged > ${record.scratch.idleDays} d${expired.length ? ` (${names})` : ''}; kept: ${kept || 'none'}`);
+    }
+  }
+
   const config = readText(join(record.home, 'config.toml'));
   for (const { plugin, server } of record.disabledPluginMcpServers ?? []) {
     const state = pluginServerState(config, plugin, server);
@@ -281,7 +406,8 @@ function writeIfChanged(path, text, log, label) {
 
 export async function apply(record, scope, { script, parameters }) {
   const log = [];
-  const want = (s) => scope === 'all' || scope === s;
+  const scopes = String(scope).split(',');
+  const want = (s) => scopes.includes('all') || scopes.includes(s);
 
   if (want('placement')) {
     const rc = readText(record.shellRc);
@@ -328,6 +454,22 @@ export async function apply(record, scope, { script, parameters }) {
       mkdirSync(dirname(dest), { recursive: true });
       renameSync(f.path, dest);
       log.push(`moved legacy ${relative(record.home, f.path)}`);
+    }
+  }
+
+  if (want('scratch') && record.scratch) {
+    const commons = new Set();
+    for (const x of observeScratch(record).filter((e) => e.expire)) {
+      try {
+        rmSync(x.path, { recursive: true, force: true });
+        log.push(`expired ${x.path} (${x.reason})`);
+      } catch (err) { log.push(`could not remove ${x.path}: ${err.code ?? err.message}`); }
+      for (const c of x.checkouts) if (c.common) commons.add(c.common);
+    }
+    // Removed worktrees leave registrations behind in their repository; git's own prune drops them.
+    for (const c of commons) {
+      if (!existsSync(c)) continue;
+      try { execFileSync('git', ['--git-dir', c, 'worktree', 'prune'], { stdio: 'ignore' }); log.push(`git worktree prune ${c}`); } catch { log.push(`git worktree prune failed for ${c}`); }
     }
   }
 

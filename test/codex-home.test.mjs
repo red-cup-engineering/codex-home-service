@@ -1,8 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import {
   BEGIN, END, mergeManagedBlock, withoutManagedBlock, shellRcLines, pluginHeader, pluginServerState, pluginLines,
   selectRetention, selectLegacy, renderTimerUnits, installedPaths, uncoveredPacks, classifyLogin,
+  decideScratch, scratchActivity, checkoutState,
 } from '../src/codex-home.mjs';
 
 const record = {
@@ -102,4 +107,62 @@ test('timer units come from the record (CH-7, CH-11)', () => {
   assert.match(u.service, /ExecStart=\/n\/node \/svc\/scripts\/codex-home\.mjs apply --scope=retention --parameters=\/rec\/codex-home\.json/);
   assert.match(u.timer, /OnCalendar=daily/);
   assert.match(u.timer, /OnBootSec=15min/);
+});
+
+test('the timer also expires scratch when the record declares scratch roots (CH-7, CH-16)', () => {
+  const u = renderTimerUnits({ ...record, scratch: { idleDays: 7, roots: [] } }, '/i/s.mjs', '/i/r.json');
+  assert.match(u.service, /apply --scope=retention,scratch --parameters=\/i\/r\.json/);
+});
+
+test('a scratch entry expires only when idle, unopened, unmounted, unkept, and its checkouts are clean and pushed (CH-16)', () => {
+  const idle = { declaredKeep: false, mount: false, inUse: false, activity: { complete: true, recent: false, newestMs: 0 }, checkouts: [] };
+  assert.equal(decideScratch(idle).expire, true);
+  assert.equal(decideScratch({ ...idle, declaredKeep: true }).reason, 'kept by the record');
+  assert.equal(decideScratch({ ...idle, mount: true }).expire, false);
+  assert.equal(decideScratch({ ...idle, inUse: true }).reason, 'open in a running process');
+  assert.equal(decideScratch({ ...idle, activity: { ...idle.activity, complete: false } }).reason, 'too large to prove idle');
+  assert.equal(decideScratch({ ...idle, activity: { ...idle.activity, recent: true } }).reason, 'active');
+  assert.equal(decideScratch({ ...idle, checkouts: [{ ok: true }, { ok: false, reason: 'commits on no remote', path: '/w' }] }).reason, 'commits on no remote in /w');
+});
+
+const tree = () => {
+  const root = mkdtempSync(join(tmpdir(), 'scratch-'));
+  mkdirSync(join(root, 'a', 'b', 'c', 'd'), { recursive: true });
+  writeFileSync(join(root, 'a', 'b', 'c', 'd', 'f'), 'x');
+  const old = new Date(Date.now() - 30 * DAY);
+  for (const p of ['a/b/c/d/f', 'a/b/c/d', 'a/b/c', 'a/b', 'a', '.']) utimesSync(join(root, p), old, old);
+  return root;
+};
+
+test('scratch activity sees a change deep in the tree, stops at its depth and directory limits (CH-9, CH-16)', () => {
+  const root = tree();
+  try {
+    const cutoff = Date.now() - 7 * DAY;
+    assert.deepEqual([scratchActivity(root, cutoff).recent, scratchActivity(root, cutoff).complete], [false, true]);
+    writeFileSync(join(root, 'a', 'b', 'c', 'new'), 'y');            // a create moves c's mtime
+    assert.equal(scratchActivity(root, cutoff).recent, true);
+    assert.equal(scratchActivity(root, cutoff, { depth: 2 }).recent, false);
+    assert.equal(scratchActivity(root, cutoff, { dirLimit: 1 }).complete, false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a checkout holds its scratch entry until it is clean and every commit is on a remote (CH-16)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'scratch-git-'));
+  const git = (cwd, ...a) => execFileSync('git', ['-c', 'user.email=t@example.invalid', '-c', 'user.name=t', '-c', 'init.defaultBranch=main', ...a], { cwd, stdio: 'ignore' });
+  try {
+    git(root, 'init', '--bare', 'remote.git');
+    git(root, 'clone', 'remote.git', 'work');
+    const w = join(root, 'work');
+    writeFileSync(join(w, 'f'), '1'); git(w, 'add', 'f'); git(w, 'commit', '-m', '1'); git(w, 'push', 'origin', 'HEAD:main');
+    git(w, 'fetch', 'origin');
+    assert.equal(checkoutState(w).ok, true);
+    writeFileSync(join(w, 'untracked'), 'x');
+    assert.equal(checkoutState(w).reason, 'uncommitted changes');
+    rmSync(join(w, 'untracked'));
+    writeFileSync(join(w, 'f'), '2'); git(w, 'commit', '-am', '2');
+    assert.equal(checkoutState(w).reason, 'commits on no remote');
+    const orphan = join(root, 'orphan'); mkdirSync(orphan);
+    writeFileSync(join(orphan, '.git'), 'gitdir: /nonexistent/worktrees/x\n');
+    assert.equal(checkoutState(orphan).reason, 'git metadata already gone');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
