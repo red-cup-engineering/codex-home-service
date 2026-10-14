@@ -1,0 +1,11 @@
+{
+  "name": "@red-cup-engineering/codex-home-service",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Keeps a Codex home's placement, login link, searched data, workspace scans and plugin servers bounded, from one parameter record.",
+  "files": ["scripts", "specifications", "src"],
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "engines": { "node": ">=22.5" },
+  "bin": { "codex-home": "./scripts/codex-home.mjs" },
+  "exports": { ".": "./src/codex-home.mjs" }
+}
