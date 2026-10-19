@@ -1,9 +1,10 @@
 // Codex home service: keeps a Codex home's placement, login link, searched data, workspace scans and plugin
-// servers and agent scratch bounded, from one parameter record (specifications/requirements.md, CH-1..CH-16).
+// servers and agent scratch bounded, from one parameter record (specifications/requirements.md, CH-1..CH-22).
 // Node built-ins only.
 import {
   readFileSync, writeFileSync, existsSync, lstatSync, statSync, readdirSync, mkdirSync, renameSync,
-  copyFileSync, mkdtempSync, rmSync, readlinkSync, symlinkSync,
+  copyFileSync, mkdtempSync, rmSync, readlinkSync, symlinkSync, statfsSync,
+  openSync, closeSync, fsyncSync,
 } from 'node:fs';
 import { join, dirname, relative, resolve } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
@@ -108,6 +109,7 @@ export function renderTimerUnits(record, script, parameters) {
       '',
       '[Service]',
       'Type=oneshot',
+      'SuccessExitStatus=2',              // apply exits 2 when drift remains (CH-18 low, CH-19 compaction due): it ran
       `ExecStart=${record.node} ${script} apply --scope=${scopes} --parameters=${parameters}`,
       'Nice=19',
       'IOSchedulingClass=idle',
@@ -139,6 +141,14 @@ export function loadRecord(path) {
 
 function readText(p) { return existsSync(p) ? readFileSync(p, 'utf8') : ''; }
 function lstatOrNull(p) { try { return lstatSync(p); } catch { return null; } }
+
+/** CH-22: the environment `systemctl --user` needs to find the manager that runs the timer; a wsl.exe shell has none. */
+function userManagerEnv(env = process.env) {
+  return env.XDG_RUNTIME_DIR ? env : { ...env, XDG_RUNTIME_DIR: `/run/user/${process.getuid()}` };
+}
+function systemctlUser(...args) {
+  return execFileSync('systemctl', ['--user', ...args], { encoding: 'utf8', env: userManagerEnv(), stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+}
 
 /** Every file in the searched folder (the folder Codex's search reads anyway; nothing else is walked). */
 export function sessionFiles(home) {
@@ -187,7 +197,7 @@ function gitMaintenanceState(repo) {
   const packs = existsSync(packDir) ? readdirSync(packDir).filter((n) => n.endsWith('.pack')).map((n) => ({ mtimeMs: statSync(join(packDir, n)).mtimeMs })) : [];
   const midx = lstatOrNull(join(packDir, 'multi-pack-index'));
   const timers = ['hourly', 'daily', 'weekly'].map((s) => {
-    try { return `${s}:${execFileSync('systemctl', ['--user', 'is-enabled', `git-maintenance@${s}.timer`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()}`; }
+    try { return `${s}:${systemctlUser('is-enabled', `git-maintenance@${s}.timer`)}`; }
     catch { return `${s}:disabled`; }
   });
   return { packs: packs.length, uncoveredPacks: uncoveredPacks(packs, midx?.mtimeMs ?? null), timers, timersEnabled: timers.every((t) => t.endsWith(':enabled')) };
@@ -209,8 +219,24 @@ function loginState(record) {
 }
 function readlinkOrNull(p) { try { return readlinkSync(p); } catch { return null; } }
 
-function loginShellCodexHome() {
-  return execFileSync('bash', ['-lc', 'printf %s "${CODEX_HOME:-$HOME/.codex}"'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+/**
+ * CH-1: what a login shell resolves when it starts the way the desktop app starts the app-server, with the
+ * Windows profile's Codex folder already in CODEX_HOME (forwarded through WSLENV; measured 2026-10-18).
+ */
+export function loginShellCodexHome(forwarded, env = process.env) {
+  return execFileSync('bash', ['-lc', 'printf %s "${CODEX_HOME:-$HOME/.codex}"'], { encoding: 'utf8', env: { ...env, CODEX_HOME: forwarded }, stdio: ['ignore', 'pipe', 'ignore'] });
+}
+
+/** CH-17: the CODEX_HOME each running Codex app-server started with ({pid, home}), read from `proc`. */
+export function runningAppServerHomes(proc = '/proc', defaultHome = join(homedir(), '.codex')) {
+  const out = [];
+  for (const pid of readdirSync(proc).filter((d) => /^\d+$/.test(d))) {
+    let argv, env;
+    try { argv = readFileSync(join(proc, pid, 'cmdline'), 'utf8').split('\0'); env = readFileSync(join(proc, pid, 'environ'), 'utf8').split('\0'); } catch { continue; }
+    if (!/(^|\/)codex$/.test(argv[0] ?? '') || !argv.includes('app-server')) continue;
+    out.push({ pid: Number(pid), home: env.find((e) => e.startsWith('CODEX_HOME='))?.slice('CODEX_HOME='.length) || defaultHome });
+  }
+  return out;
 }
 
 const timerDir = () => join(homedir(), '.config', 'systemd', 'user');
@@ -245,9 +271,10 @@ function gitDirOf(dotGit) {
 /**
  * Newest change in a scratch entry: directory mtimes (they move on every create, delete and rename), the entry's
  * own files, and each checkout's index and HEAD log (they move on every stage, commit and checkout), to
- * SCRATCH_DEPTH levels. Stops at the first change after `cutoffMs`, so an active entry costs a few reads (CH-9).
+ * SCRATCH_DEPTH levels, without entering the directories named in `opaque` (CH-20). Stops at the first change after
+ * `cutoffMs`, so an active entry costs a few reads (CH-9).
  */
-export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimit = SCRATCH_DIR_LIMIT } = {}) {
+export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimit = SCRATCH_DIR_LIMIT, opaque = new Set() } = {}) {
   const st = lstatSync(path);
   let newest = st.mtimeMs, seen = 0;
   const repos = [];
@@ -268,7 +295,7 @@ export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimi
       } else if (e.isDirectory()) {
         newest = Math.max(newest, lstatOrNull(p)?.mtimeMs ?? 0);
         if (++seen > dirLimit) return done(false);
-        if (level + 1 < depth) queue.push([p, level + 1]);
+        if (level + 1 < depth && !opaque.has(e.name)) queue.push([p, level + 1]);
       } else if (level === 0) {
         newest = Math.max(newest, lstatOrNull(p)?.mtimeMs ?? 0);
       }
@@ -277,8 +304,11 @@ export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimi
   return done(true);
 }
 
-/** A git checkout in scratch may go only when clean and with every commit on a remote (CH-16). */
-export function checkoutState(root) {
+/**
+ * A git checkout in scratch may go only when clean and with every commit on a remote (CH-16), or, for a linked
+ * worktree whose repository lies outside the scratch `entry`, on a branch that removing the entry leaves (CH-21).
+ */
+export function checkoutState(root, entry = root) {
   const dotGit = join(root, '.git');
   const gitdir = gitDirOf(dotGit);
   if (!gitdir) return { path: root, ok: true, reason: 'git metadata already gone', common: null };
@@ -286,7 +316,10 @@ export function checkoutState(root) {
   const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   try {
     if (git('status', '--porcelain', '--untracked-files=normal')) return { path: root, ok: false, reason: 'uncommitted changes', common };
-    if (git('rev-list', '-n', '1', 'HEAD', '--not', '--remotes')) return { path: root, ok: false, reason: 'commits on no remote', common };
+    const outside = !`${common}/`.startsWith(`${resolve(entry)}/`);
+    if (git('rev-list', '-n', '1', 'HEAD', '--not', '--remotes', ...(outside ? ['--branches'] : []))) {
+      return { path: root, ok: false, reason: outside ? 'commits on no remote or branch' : 'commits on no remote', common };
+    }
   } catch { return { path: root, ok: false, reason: 'unreadable checkout', common }; }
   return { path: root, ok: true, reason: 'clean and pushed', common };
 }
@@ -305,19 +338,54 @@ function openPaths() {
 const mountPoints = () => readText('/proc/self/mountinfo').split('\n').map((l) => l.split(' ')[4]).filter(Boolean);
 const under = (paths, p) => paths.some((x) => x === p || x.startsWith(`${p}/`));
 
+// ---------- CH-18/CH-19 headroom ----------
+export const maintenanceReferral = record => record.headroom?.maintenanceReferral || 'Existing WSL host maintenance owner: exact-disk checkpoint, authority and physical reopening required; no maintenance is admitted here.';
+export function refuseAutomaticCollection(record) {
+  if (record.headroom?.guix) throw new Error('unqualified automatic Guix collection refused before effects; ' + maintenanceReferral(record));
+}
+const GB = (b) => `${(b / 1e9).toFixed(1)} GB`;
+
+/** Low when either side of the disk image is under the floor; `slack` is what the image holds beyond the VM's use. */
+export function judgeHeadroom({ vmFree, vmUsed, hostFree, imageBytes }, h) {
+  if (!Number.isFinite(h.floorBytes) || h.floorBytes <= 0) throw new Error('finite positive housekeeping floor required');
+  const slack = imageBytes == null ? null : Math.max(0, imageBytes - vmUsed);
+  return { low: Number.isFinite(vmFree) && Number.isFinite(hostFree) ? Math.min(vmFree, hostFree) < h.floorBytes : null, slack, compact: slack != null && slack > (h.compactAboveBytes ?? Infinity) };
+}
+
+/** Two statfs calls and one stat (CH-9). Null when the record declares no headroom. */
+export function observeHeadroom(record) {
+  const h = record.headroom;
+  if (!h) return null;
+  const space = (p) => { try { const s = statfsSync(p); return { free: s.bavail * s.bsize, used: (s.blocks - s.bfree) * s.bsize }; } catch { return null; } };
+  const vm = space(h.vmVolume), host = space(h.hostVolume);
+  const m = { vmFree: vm?.free ?? null, vmUsed: vm?.used ?? null, hostFree: host?.free ?? null, imageBytes: lstatOrNull(h.diskImage)?.size ?? null };
+  return { ...m, ...judgeHeadroom(m, h) };
+}
+
+/** The scratch idle limit in force: the record's days, or CH-18's hours while headroom is low. */
+export function scratchLimit(record, headroom) {
+  if (headroom && headroom.low === null) throw new Error('unknown pressure: scratch retirement held; ' + maintenanceReferral(record));
+  const days = record.scratch.idleDays, hours = record.headroom?.idleHours;
+  if (!Number.isFinite(days) || days <= 0 || (headroom?.low && (!Number.isFinite(hours) || hours <= 0 || hours > days * 24))) throw new Error('finite bounded scratch cutoff required');
+  return headroom?.low
+    ? { ms: record.headroom.idleHours * 3_600_000, text: `${record.headroom.idleHours} h` }
+    : { ms: record.scratch.idleDays * DAY_MS, text: `${record.scratch.idleDays} d` };
+}
+
 /** Every top-level entry under each scratch root, measured and decided (CH-16). */
-export function observeScratch(record, now = Date.now()) {
+export function observeScratch(record, now = Date.now(), { idleMs = record.scratch?.idleDays * DAY_MS } = {}) {
   const s = record.scratch;
   if (!s) return [];
-  const cutoffMs = now - s.idleDays * DAY_MS;
-  const open = openPaths(), mounts = mountPoints();
-  return s.roots.flatMap((root) => (existsSync(root.path) ? readdirSync(root.path) : []).map((name) => {
+  const cutoffMs = now - idleMs;
+  const open = openPaths(), mounts = mountPoints(), opaque = new Set(s.opaqueDirs ?? []);
+  const admits = (root, name) => !root.match || new RegExp(root.match).test(name);
+  return s.roots.flatMap((root) => (existsSync(root.path) ? readdirSync(root.path) : []).filter((name) => admits(root, name)).map((name) => {
     const path = join(root.path, name);
     const e = { root: root.path, name, path, declaredKeep: (root.keep ?? []).includes(name), mount: under(mounts, path), inUse: under(open, path) };
     let activity = { newestMs: 0, recent: false, complete: true, repos: [] }, checkouts = [];
     if (!e.declaredKeep && !e.mount && !e.inUse) {
-      activity = scratchActivity(path, cutoffMs);
-      if (activity.complete && !activity.recent) checkouts = activity.repos.map(checkoutState);
+      activity = scratchActivity(path, cutoffMs, { opaque });
+      if (activity.complete && !activity.recent) checkouts = activity.repos.map((repo) => checkoutState(repo, path));
     }
     const full = { ...e, activity, checkouts };
     return { ...full, ...decideScratch(full) };
@@ -329,10 +397,13 @@ export async function observe(record, { script, parameters }) {
   const add = (id, ok, detail) => items.push({ id, status: ok ? 'current' : 'drift', detail });
   const now = Date.now();
 
-  const resolved = loginShellCodexHome();
-  add('CH-1 home', resolved === record.home && !resolved.startsWith('/mnt/'), `login shell resolves ${resolved}`);
+  const resolved = loginShellCodexHome(record.windowsProfileCodexDir);
+  add('CH-1 home', resolved === record.home && !resolved.startsWith('/mnt/'), `login shell started with the app's CODEX_HOME resolves ${resolved}`);
   const rc = readText(record.shellRc);
   add('CH-1 shell block', mergeManagedBlock(rc, shellRcLines(record)).changed === false, record.shellRc);
+  if (record.loginProfile) add('CH-1 login profile block', mergeManagedBlock(readText(record.loginProfile), shellRcLines(record)).changed === false, record.loginProfile);
+  const servers = runningAppServerHomes(), astray = servers.filter((s) => s.home !== record.home);
+  add('CH-17 running app-server', astray.length === 0, !servers.length ? 'none running' : astray.length ? `${astray.map((s) => `pid ${s.pid} on ${s.home}`).join('; ')}: restart the Codex app` : `${servers.length} on ${record.home}`);
 
   const login = loginState(record);
   add('CH-2 one login', login.ok, login.detail);
@@ -359,8 +430,19 @@ export async function observe(record, { script, parameters }) {
     }
   }
 
+  const headroom = observeHeadroom(record);
+  if (headroom) {
+    const h = record.headroom;
+    add('CH-18 headroom', headroom.low === false,
+      `VM ${GB(headroom.vmFree)} free, host ${headroom.hostFree == null ? 'unread' : `${GB(headroom.hostFree)} free`} (floor ${GB(h.floorBytes)})`);
+    add('CH-19 disk image', !headroom.compact, headroom.slack == null ? `${h.diskImage} unread; HELD maintenance: ${maintenanceReferral(record)}`
+      : `${GB(headroom.imageBytes)} image holds ${GB(headroom.slack)} beyond ${GB(headroom.vmUsed)} used${headroom.compact ? `; HELD maintenance: ${maintenanceReferral(record)}` : ''}`);
+  }
   if (record.scratch) {
-    const entries = observeScratch(record, now);
+    let limit;
+    try { limit = scratchLimit(record, headroom); }
+    catch (error) { add('CH-18 scratch admission', false, error.message); return items; }
+    const entries = observeScratch(record, now, { idleMs: limit.ms });
     for (const root of record.scratch.roots) {
       const mine = entries.filter((x) => x.root === root.path);
       const expired = mine.filter((x) => x.expire);
@@ -371,7 +453,7 @@ export async function observe(record, { script, parameters }) {
       }, {})).map(([k, n]) => `${n} ${k}`).join(', ');
       const names = expired.slice(0, 6).map((x) => x.name).join(', ') + (expired.length > 6 ? ', ...' : '');
       add(`CH-16 scratch ${root.path}`, expired.length === 0,
-        `${expired.length} unchanged > ${record.scratch.idleDays} d${expired.length ? ` (${names})` : ''}; kept: ${kept || 'none'}`);
+        `${expired.length} unchanged > ${limit.text}${expired.length ? ` (${names})` : ''}; kept: ${kept || 'none'}`);
     }
   }
 
@@ -386,7 +468,7 @@ export async function observe(record, { script, parameters }) {
   const svc = readText(join(timerDir(), 'codex-home-retention.service'));
   const tmr = readText(join(timerDir(), 'codex-home-retention.timer'));
   let enabled = '';
-  try { enabled = execFileSync('systemctl', ['--user', 'is-enabled', 'codex-home-retention.timer'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { enabled = 'disabled'; }
+  try { enabled = systemctlUser('is-enabled', 'codex-home-retention.timer'); } catch { enabled = 'disabled'; }
   const unitsOk = svc === units.service && tmr === units.timer;
   add('CH-7 retention timer', unitsOk && enabled === 'enabled', `units ${unitsOk ? 'current' : 'differ'}, ${enabled}`);
   const copies = installPlan(record, { script, parameters });
@@ -396,6 +478,18 @@ export async function observe(record, { script, parameters }) {
 
 // ---------- host change ----------
 
+function writeInstalled(path, text, log) {
+  if (readText(path) === text) return false;
+  mkdirSync(dirname(path), { recursive: true });
+  const staged = path + '.install-' + process.pid;
+  const fd = openSync(staged, 'wx', 0o600);
+  try { writeFileSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(staged, path);
+  const dir = openSync(dirname(path), 'r');
+  try { fsyncSync(dir); } finally { closeSync(dir); }
+  log.push('installed ' + path);
+  return true;
+}
 function writeIfChanged(path, text, log, label) {
   if (readText(path) === text) return false;
   mkdirSync(dirname(path), { recursive: true });
@@ -404,14 +498,22 @@ function writeIfChanged(path, text, log, label) {
   return true;
 }
 
-export async function apply(record, scope, { script, parameters }) {
+export async function apply(record, scope, { script, parameters }, ports = {}) {
   const log = [];
   const scopes = String(scope).split(',');
   const want = (s) => scopes.includes('all') || scopes.includes(s);
+  // All preconditions precede retention, scratch or any other effect. The
+  // timer-only installer deliberately admits no maintenance or cleanup scope.
+  if (want('scratch') || want('retention')) refuseAutomaticCollection(record);
+  if (want('scratch')) {
+    scratchLimit(record, observeHeadroom(record));
+  }
 
   if (want('placement')) {
     const rc = readText(record.shellRc);
     writeIfChanged(record.shellRc, mergeManagedBlock(rc, shellRcLines(record)).text, log, `${record.shellRc} (managed block)`);
+    if (record.loginProfile) writeIfChanged(record.loginProfile, mergeManagedBlock(readText(record.loginProfile), shellRcLines(record)).text, log, `${record.loginProfile} (managed block)`);
+    for (const s of runningAppServerHomes().filter((s) => s.home !== record.home)) log.push(`WINDOWS restart the Codex app: its app-server (pid ${s.pid}) still runs on ${s.home}`);
     const l = loginState(record);
     if (!l.ok) {
       const same = () => existsSync(l.homeAuth) && existsSync(l.winAuth) && readFileSync(l.homeAuth).equals(readFileSync(l.winAuth));
@@ -458,8 +560,9 @@ export async function apply(record, scope, { script, parameters }) {
   }
 
   if (want('scratch') && record.scratch) {
+    const headroom = observeHeadroom(record);
     const commons = new Set();
-    for (const x of observeScratch(record).filter((e) => e.expire)) {
+    for (const x of observeScratch(record, Date.now(), { idleMs: scratchLimit(record, headroom).ms }).filter((e) => e.expire)) {
       try {
         rmSync(x.path, { recursive: true, force: true });
         log.push(`expired ${x.path} (${x.reason})`);
@@ -471,6 +574,7 @@ export async function apply(record, scope, { script, parameters }) {
       if (!existsSync(c)) continue;
       try { execFileSync('git', ['--git-dir', c, 'worktree', 'prune'], { stdio: 'ignore' }); log.push(`git worktree prune ${c}`); } catch { log.push(`git worktree prune failed for ${c}`); }
     }
+    if (headroom?.low || headroom?.compact) log.push('HELD maintenance: ' + maintenanceReferral(record));
   }
 
   if (want('workspace')) {
@@ -479,7 +583,7 @@ export async function apply(record, scope, { script, parameters }) {
       writeIfChanged(p, mergeManagedBlock(readText(p), ws.excludes).text, log);
       if (ws.gitMaintenance) {
         const m = gitMaintenanceState(ws.path);
-        if (!m.timersEnabled) { execFileSync('git', ['-C', ws.path, 'maintenance', 'start'], { stdio: 'ignore' }); log.push(`git maintenance start ${ws.path}`); }
+        if (!m.timersEnabled) { execFileSync('git', ['-C', ws.path, 'maintenance', 'start'], { stdio: 'ignore', env: userManagerEnv() }); log.push(`git maintenance start ${ws.path}`); }
         if (m.uncoveredPacks > (ws.maxUncoveredPacks ?? 10)) { execFileSync('git', ['-C', ws.path, 'multi-pack-index', 'write'], { stdio: 'ignore' }); log.push(`multi-pack-index write ${ws.path} (${m.uncoveredPacks} packs were uncovered)`); }
       }
     }
@@ -497,13 +601,15 @@ export async function apply(record, scope, { script, parameters }) {
   }
 
   if (want('timer')) {
-    for (const c of installPlan(record, { script, parameters })) writeIfChanged(c.to, readText(c.from), log);
+    const directory = ports.timerDirectory?.() ?? timerDir();
+    const control = ports.systemctlUser ?? systemctlUser;
+    for (const c of installPlan(record, { script, parameters })) writeInstalled(c.to, readText(c.from), log);
     const inst = installedPaths(record);
     const units = renderTimerUnits(record, inst.script, inst.parameters);
-    const a = writeIfChanged(join(timerDir(), 'codex-home-retention.service'), units.service, log);
-    const b = writeIfChanged(join(timerDir(), 'codex-home-retention.timer'), units.timer, log);
-    if (a || b) execFileSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore' });
-    execFileSync('systemctl', ['--user', 'enable', '--now', 'codex-home-retention.timer'], { stdio: 'ignore' });
+    const a = writeIfChanged(join(directory, 'codex-home-retention.service'), units.service, log);
+    const b = writeIfChanged(join(directory, 'codex-home-retention.timer'), units.timer, log);
+    if (a || b) control('daemon-reload');
+    control('enable', '--now', 'codex-home-retention.timer');
   }
   return log;
 }
