@@ -250,7 +250,7 @@ test('a root\'s match limits which of its entries are scratch (CH-16)', () => {
 });
 
 test('legacy automatic collection refuses before even retention effects', async () => {
-  await assert.rejects(() => apply({ headroom: { guix: '/must-never-run' } }, 'retention,scratch', {}), /unqualified automatic Guix collection refused before effects/);
+  for (const scope of ['retention,scratch', 'retention', 'scratch']) await assert.rejects(() => apply({ headroom: { guix: '/must-never-run' } }, scope, {}), /unqualified automatic Guix collection refused before effects/);
   assert.throws(() => scratchLimit({ scratch: { idleDays: 2 }, headroom: { idleHours: 6 } }, { low: null }), /retirement held/);
   assert.throws(() => scratchLimit({ scratch: { idleDays: 2 }, headroom: { idleHours: Infinity } }, { low: true }), /finite bounded/);
 });

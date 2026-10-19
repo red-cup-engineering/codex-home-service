@@ -504,8 +504,8 @@ export async function apply(record, scope, { script, parameters }, ports = {}) {
   const want = (s) => scopes.includes('all') || scopes.includes(s);
   // All preconditions precede retention, scratch or any other effect. The
   // timer-only installer deliberately admits no maintenance or cleanup scope.
+  if (want('scratch') || want('retention')) refuseAutomaticCollection(record);
   if (want('scratch')) {
-    refuseAutomaticCollection(record);
     scratchLimit(record, observeHeadroom(record));
   }
 
