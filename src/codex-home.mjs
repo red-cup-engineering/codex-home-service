@@ -341,7 +341,7 @@ const under = (paths, p) => paths.some((x) => x === p || x.startsWith(`${p}/`));
 // ---------- CH-18/CH-19 headroom ----------
 export const maintenanceReferral = record => record.headroom?.maintenanceReferral || 'Existing WSL host maintenance owner: exact-disk checkpoint, authority and physical reopening required; no maintenance is admitted here.';
 export function refuseAutomaticCollection(record) {
-  if (record.headroom?.guix) throw new Error('unqualified automatic Guix collection refused before effects; ' + maintenanceReferral(record));
+  if (record.headroom?.guix || record.headroom?.compactCommand) throw new Error('unqualified automatic maintenance selector refused before effects; ' + maintenanceReferral(record));
 }
 const GB = (b) => `${(b / 1e9).toFixed(1)} GB`;
 
@@ -502,9 +502,9 @@ export async function apply(record, scope, { script, parameters }, ports = {}) {
   const log = [];
   const scopes = String(scope).split(',');
   const want = (s) => scopes.includes('all') || scopes.includes(s);
-  // All preconditions precede retention, scratch or any other effect. The
-  // timer-only installer deliberately admits no maintenance or cleanup scope.
-  if (want('scratch') || want('retention')) refuseAutomaticCollection(record);
+  // Reject active legacy maintenance selectors before cleanup OR installing
+  // them as the future timer's record. Timer installation executes no cleanup.
+  if (want('scratch') || want('retention') || want('timer')) refuseAutomaticCollection(record);
   if (want('scratch')) {
     scratchLimit(record, observeHeadroom(record));
   }

@@ -66,4 +66,4 @@ Each requirement has one shall. Identifiers are stable.
 4. The retention timer is listed by `systemctl --user list-timers` and its last run succeeded.
 5. With headroom below the floor, one apply leaves no scratch entry idle longer than `headroom.idleHours` except those CH-16 keeps, and preserves all original Guix roots and pending maintenance custody; no automatic store collection runs.
 
-- CH-23. A legacy active `headroom.guix` selector shall refuse before any scratch/retention effect; a timer-only installation shall copy the exact selected code/record atomically without executing cleanup or maintenance.
+- CH-23. Legacy active `headroom.guix` or `headroom.compactCommand` selectors shall refuse before any scratch/retention effect or timer installation. Inactive `headroom.legacyMaintenance` provenance remains admissible. A timer-only installation shall copy the exact admitted code/record atomically without executing cleanup or maintenance, so an obsolete selection cannot reintroduce a future failing timer record.
