@@ -49,7 +49,7 @@ Each requirement has one shall. Identifiers are stable.
 
 ## Observation and repair
 
-- CH-9. When asked to plan, the service shall change nothing, shall not walk any tree larger than the searched folder's directory listing, and shall report each item as current or drift with its measured size. CH-16's idle check is the one bounded exception: it reads directory metadata in each scratch entry to a fixed depth and stops at the first change inside the idle window.
+- CH-9. When asked to plan, the service shall change nothing and read no scratch descendants or checkout state; it reports scratch retirement as held rather than claiming cleanliness. CH-16's proof belongs to explicitly selected scratch apply.
 - CH-10. When asked to apply, the service shall change only items not current, so a second apply changes nothing.
 - CH-11. The service shall carry no host, user, path, size or brand in its code; every particular shall come from the parameter record.
 - CH-12. The service shall run on Node's built-in modules alone.
@@ -69,3 +69,14 @@ Each requirement has one shall. Identifiers are stable.
 - CH-23. Legacy active `headroom.guix` or `headroom.compactCommand` selectors shall refuse before any scratch/retention effect or timer installation. Inactive `headroom.legacyMaintenance` provenance remains admissible. A timer-only installation shall copy the exact admitted code/record atomically without executing cleanup or maintenance, so an obsolete selection cannot reintroduce a future failing timer record.
 - CH-24. Scratch checkout safety shall use finite native child time/output and aggregate checkout-read budgets, without index writes, hooks, filesystem monitors, submodule recursion or repository discovery beyond the exact declared scratch checkout. A changed, ancestor, protected home/workspace, oversized, timed-out or otherwise unknown checkout shall remain held. Untracked safety shall not fall back to a new filesystem catalogue or a whole-workspace scan.
 - CH-25. An optional scratch-root `retirementOwner` shall identify its existing lifecycle owner with a canonical credential-free HTTPS service identity. Observation and apply shall hold that entire root, including every current and unknown descendant, before any listing, activity scan, checkout proof or removal. A malformed owner identity shall refuse before effects, including installing it as the timer's future record. This field delegates retirement away from generic age policy; it grants no cleanup authority to either service.
+
+- CH-26. The record-selected shared harness controller shall reconcile and inspect the workspace source references for both providers without copying executable bodies or manufacturing Codex hook trust; source registration alone never proves active-session enforcement.
+- CH-27. Thread observation shall use the native provider metadata protocol with a five-second total deadline, finite output/page budgets and log-repair scanning explicitly disabled; unavailable metadata stays unknown without private-storage access or fallback.
+
+Leader, 2026-10-23: "these giant disc-reads are KILLING our system" and "Where is your harness? Where is Claude's harness?". The failed carrier was a missing Claude workspace projection and a Codex hook pointing to a retired source path. Health itself repeated scratch metadata/checkout proofs and database copies. CH-9, CH-26 and CH-27 remove those reads and make registration drift visible through the ordinary owner.
+
+- CH-28. Known heavy commands shall refuse when their shared admission lock or flock is unavailable, including a lock that disappears after rewriting; no lock failure may run the original command unlocked.
+
+- CH-29. When harnessResources is selected, the existing retention schedule shall reconcile those exact provider registrations at its unchanged cadence, preserving unrelated hooks and provider trust.
+
+Leader, 2026-10-23: "We shuoldn't have any sqlite or sql anywhere lol". CH-27 replaces direct private-storage access with the provider-owned thread/list and thread/archive protocol. The house service imports no SQL driver, issues no SQL and owns no provider database. Vendor internals remain vendor-owned; deleting or rewriting them is not a migration.

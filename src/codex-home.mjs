@@ -3,12 +3,14 @@
 // Node built-ins only.
 import {
   readFileSync, writeFileSync, existsSync, lstatSync, statSync, readdirSync, mkdirSync, renameSync,
-  copyFileSync, mkdtempSync, rmSync, readlinkSync, symlinkSync, statfsSync,
-  openSync, closeSync, fsyncSync, realpathSync,
+  rmSync, readlinkSync, symlinkSync, statfsSync,
+  openSync, closeSync, fsyncSync, realpathSync, opendirSync,
 } from 'node:fs';
 import { join, dirname, relative, resolve } from 'node:path';
-import { tmpdir, homedir } from 'node:os';
+import { homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import { listProviderThreads, withThreadProvider } from './thread-provider.mjs';
 
 export const BEGIN = '# BEGIN codex-home-service (managed: change the parameter record, not this block)';
 export const END = '# END codex-home-service';
@@ -101,7 +103,7 @@ export function decideScratch(e) {
 
 export function renderTimerUnits(record, script, parameters) {
   const r = record.retention;
-  const scopes = record.scratch ? 'retention,scratch' : 'retention';
+  const scopes = ['retention', ...(record.scratch ? ['scratch'] : []), ...(record.harnessResources ? ['harness'] : [])].join(',');
   return {
     service: [
       '[Unit]',
@@ -164,21 +166,15 @@ export function sessionFiles(home) {
   return out;
 }
 
-/** Threads from a copy of the newest state_N.sqlite (no lock on the live database). */
-export async function readThreads(home) {
-  const dir = join(home, 'sqlite');
-  const db = readdirSync(dir).map((n) => /^state_(\d+)\.sqlite$/.exec(n)).filter(Boolean)
-    .sort((a, b) => Number(b[1]) - Number(a[1]))[0]?.[0];
-  if (!db) throw new Error(`no state_N.sqlite in ${dir}`);
-  const tmp = mkdtempSync(join(tmpdir(), 'codex-home-'));
-  try {
-    for (const suffix of ['', '-wal', '-shm']) if (existsSync(join(dir, db + suffix))) copyFileSync(join(dir, db + suffix), join(tmp, db + suffix));
-    const { DatabaseSync } = await import('node:sqlite');
-    const conn = new DatabaseSync(join(tmp, db));
-    const rows = conn.prepare('select id, rollout_path, archived from threads').all();
-    conn.close();
-    return rows;
-  } finally { rmSync(tmp, { recursive: true, force: true }); }
+/** Provider metadata is authoritative; its private storage never crosses this boundary. */
+export async function readThreads(home, { binary, files = sessionFiles(home), connect = withThreadProvider } = {}) {
+  const rows = await connect({ binary, home }, listProviderThreads);
+  return rows.map(row => {
+    if (row.rollout_path !== null) return row;
+    const matches = files.filter(file => file.path.endsWith(`-${row.id}.jsonl`));
+    if (matches.length > 1) throw new Error('ambiguous rollout for native thread');
+    return { ...row, rollout_path: matches[0]?.path ?? null };
+  });
 }
 
 export function codexBinary(glob) {
@@ -242,7 +238,7 @@ export function runningAppServerHomes(proc = '/proc', defaultHome = join(homedir
 const timerDir = () => join(homedir(), '.config', 'systemd', 'user');
 
 // CH-14: the schedule runs an installed copy, so a checkout change (clean, submodule update) cannot remove it.
-const INSTALLED = ['package.json', 'src/codex-home.mjs', 'scripts/codex-home.mjs'];
+const INSTALLED = ['package.json', 'src/codex-home.mjs', 'src/thread-provider.mjs', 'scripts/codex-home.mjs'];
 export function installedPaths(record) {
   return { script: join(record.installDir, 'scripts', 'codex-home.mjs'), parameters: join(record.installDir, 'codex-home.json') };
 }
@@ -257,7 +253,7 @@ const MB = (b) => `${(b / 1e6).toFixed(0)} MB`;
 
 // ---------- CH-16 agent scratch ----------
 const SCRATCH_DEPTH = 8;
-const SCRATCH_DIR_LIMIT = 100_000;
+const SCRATCH_DIR_LIMIT = 256;
 
 /** The git directory a `.git` entry names: itself, or the target of a `gitdir:` file (null when that is gone). */
 function gitDirOf(dotGit) {
@@ -274,7 +270,8 @@ function gitDirOf(dotGit) {
  * SCRATCH_DEPTH levels, without entering the directories named in `opaque` (CH-20). Stops at the first change after
  * `cutoffMs`, so an active entry costs a few reads (CH-9).
  */
-export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimit = SCRATCH_DIR_LIMIT, opaque = new Set() } = {}) {
+export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimit = SCRATCH_DIR_LIMIT, opaque = new Set(), budget = { deadline: performance.now() + 250, remaining: 1024 } } = {}) {
+  if (performance.now() >= budget.deadline || budget.remaining <= 0) return { newestMs: 0, recent: false, complete: false, repos: [] };
   const st = lstatSync(path);
   let newest = st.mtimeMs, seen = 0;
   const repos = [];
@@ -284,9 +281,12 @@ export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimi
   for (let i = 0; i < queue.length; i++) {
     if (newest > cutoffMs) return done(true);
     const [dir, level] = queue[i];
-    let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
+    let handle;
+    try { handle = opendirSync(dir); } catch { return done(false); }
+    try { for (;;) {
+      if (performance.now() >= budget.deadline || budget.remaining-- <= 0) return done(false);
+      const e = handle.readSync();
+      if (!e) break;
       const p = join(dir, e.name);
       if (e.name === '.git') {
         repos.push(dir);
@@ -299,7 +299,7 @@ export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimi
       } else if (level === 0) {
         newest = Math.max(newest, lstatOrNull(p)?.mtimeMs ?? 0);
       }
-    }
+    } } finally { handle.closeSync(); }
   }
   return done(true);
 }
@@ -426,6 +426,7 @@ export function observeScratch(record, now = Date.now(), { idleMs = record.scrat
   const active = owners.some(owner => !owner);
   const open = active ? openPaths() : [], mounts = active ? mountPoints() : [], opaque = new Set(s.opaqueDirs ?? []);
   const budget = { deadline: performance.now() + 5000 };
+  const activityBudget = { deadline: performance.now() + 250, remaining: 1024 };
   const protectedRoots = [record.home, ...(record.workspaces ?? []).map(ws => ws.path)].filter(Boolean);
   const admits = (root, name) => !root.match || new RegExp(root.match).test(name);
   return s.roots.flatMap((root, index) => {
@@ -435,7 +436,7 @@ export function observeScratch(record, now = Date.now(), { idleMs = record.scrat
     const e = { root: root.path, name, path, declaredKeep: (root.keep ?? []).includes(name), mount: under(mounts, path), inUse: under(open, path) };
     let activity = { newestMs: 0, recent: false, complete: true, repos: [] }, checkouts = [];
     if (!e.declaredKeep && !e.mount && !e.inUse) {
-      activity = scratchActivity(path, cutoffMs, { opaque });
+      activity = scratchActivity(path, cutoffMs, { opaque, budget: activityBudget });
       if (activity.complete && !activity.recent) checkouts = activity.repos.map((repo) => checkoutState(repo, path, { protectedRoots, budget }));
     }
     const full = { ...e, activity, checkouts };
@@ -449,6 +450,13 @@ export async function observe(record, { script, parameters }) {
   const items = [];
   const add = (id, ok, detail) => items.push({ id, status: ok ? 'current' : 'drift', detail });
   const now = Date.now();
+  if (record.harnessResources) {
+    try {
+      const results = await reconcileHarnessResources(record, { dryRun: true });
+      for (const result of results) add(`CH-26 harness ${result.workspace}`, result.written.length === 0,
+        `${result.written.length ? `drift: ${result.written.join(', ')}` : 'source references current'}; active session enforcement unverified${result.codexTrustRequired ? '; Codex trust remains provider-owned' : ''}`);
+    } catch (error) { add('CH-26 harness resources', false, error.message); }
+  }
 
   const resolved = loginShellCodexHome(record.windowsProfileCodexDir);
   add('CH-1 home', resolved === record.home && !resolved.startsWith('/mnt/'), `login shell started with the app's CODEX_HOME resolves ${resolved}`);
@@ -467,11 +475,13 @@ export async function observe(record, { script, parameters }) {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const total = files.reduce((s, f) => s + f.size, 0);
   add('CH-4 searched size', total <= record.retention.searchedSoftLimitBytes, `${MB(total)} in ${files.length} files (limit ${MB(record.retention.searchedSoftLimitBytes)})`);
-  const threads = await readThreads(record.home);
-  const toArchive = selectRetention(threads, byPath, now, record.retention.idleDays);
-  add('CH-4 retention', toArchive.length === 0, `${toArchive.length} threads idle > ${record.retention.idleDays} d, ${MB(toArchive.reduce((s, t) => s + t.bytes, 0))}`);
-  const legacy = selectLegacy(files, new Set(threads.map((t) => t.rollout_path)), now);
-  add('CH-5 legacy', legacy.length === 0, `${legacy.length} unreferenced files, ${MB(legacy.reduce((s, f) => s + f.size, 0))}`);
+  try {
+    const threads = await readThreads(record.home, { binary: codexBinary(record.codexBinaryGlob), files });
+    const toArchive = selectRetention(threads, byPath, now, record.retention.idleDays);
+    add('CH-4 retention', toArchive.length === 0, `${toArchive.length} threads idle > ${record.retention.idleDays} d, ${MB(toArchive.reduce((s, t) => s + t.bytes, 0))}`);
+    const legacy = selectLegacy(files, new Set(threads.map((t) => t.rollout_path)), now);
+    add('CH-5 legacy', legacy.length === 0, `${legacy.length} unreferenced files, ${MB(legacy.reduce((s, f) => s + f.size, 0))}`);
+  } catch (error) { add('CH-4 thread query', false, `unknown; no copy or retry: ${error.message}`); }
 
   for (const ws of record.workspaces ?? []) {
     const ex = readText(join(ws.path, '.git', 'info', 'exclude'));
@@ -495,18 +505,10 @@ export async function observe(record, { script, parameters }) {
     let limit;
     try { limit = scratchLimit(record, headroom); }
     catch (error) { add('CH-18 scratch admission', false, error.message); return items; }
-    const entries = observeScratch(record, now, { idleMs: limit.ms });
     for (const root of record.scratch.roots) {
-      const mine = entries.filter((x) => x.root === root.path);
-      const expired = mine.filter((x) => x.expire);
-      const kept = Object.entries(mine.filter((x) => !x.expire).reduce((m, x) => {
-        const k = x.reason.replace(/ in \/.*$/, '');
-        m[k] = (m[k] ?? 0) + 1;
-        return m;
-      }, {})).map(([k, n]) => `${n} ${k}`).join(', ');
-      const names = expired.slice(0, 6).map((x) => x.name).join(', ') + (expired.length > 6 ? ', ...' : '');
-      add(`CH-16 scratch ${root.path}`, expired.length === 0,
-        `${expired.length} unchanged > ${limit.text}${expired.length ? ` (${names})` : ''}; kept: ${kept || 'none'}`);
+      items.push({ id: `CH-16 scratch policy ${root.path}`, status: 'current', detail: root.retirementOwner
+        ? `retirement delegated to ${root.retirementOwner}; no listing`
+        : `not inspected by health plan; scoped scratch apply owns idle > ${limit.text} proof` });
     }
   }
 
@@ -530,6 +532,19 @@ export async function observe(record, { script, parameters }) {
 }
 
 // ---------- host change ----------
+
+/** The record selects the shared owning controller; no executable copy or provider trust is fabricated. */
+export async function reconcileHarnessResources(record, { dryRun = false } = {}) {
+  const selected = record.harnessResources;
+  if (!selected) return [];
+  if (typeof selected.source !== 'string' || !selected.source.startsWith('/') || !Array.isArray(selected.workspaces)) throw new Error('harnessResources needs an absolute owning source and workspaces');
+  for (const workspace of selected.workspaces) {
+    if (typeof workspace.path !== 'string' || !workspace.path.startsWith('/') || !workspace.providers?.length || workspace.providers.some(p => !['claude', 'codex'].includes(p))) throw new Error('invalid harness resource workspace');
+  }
+  const { writeHostResourceControl } = await import(pathToFileURL(selected.source).href);
+  return selected.workspaces.map(workspace => ({ workspace: workspace.path,
+    ...writeHostResourceControl({ node: workspace.path, providers: workspace.providers, retiredSources: selected.retiredSources ?? [], dryRun }) }));
+}
 
 function writeInstalled(path, text, log) {
   if (readText(path) === text) return false;
@@ -556,6 +571,9 @@ export async function apply(record, scope, { script, parameters }, ports = {}) {
   const log = [];
   const scopes = String(scope).split(',');
   const want = (s) => scopes.includes('all') || scopes.includes(s);
+  if (want('harness')) {
+    for (const result of await reconcileHarnessResources(record)) for (const file of result.written) log.push(`harness source reference ${join(result.workspace, file)}`);
+  }
   // Reject active legacy maintenance selectors before cleanup OR installing
   // them as the future timer's record. Timer installation executes no cleanup.
   if (want('scratch') || want('retention') || want('timer')) refuseAutomaticCollection(record);
@@ -590,13 +608,14 @@ export async function apply(record, scope, { script, parameters }, ports = {}) {
     const now = Date.now();
     const files = sessionFiles(record.home);
     const byPath = new Map(files.map((f) => [f.path, f]));
-    const threads = await readThreads(record.home);
     const bin = codexBinary(record.codexBinaryGlob);
+    await withThreadProvider({ binary: bin, home: record.home }, async request => {
+    const threads = await readThreads(record.home, { binary: bin, files, connect: (_options, operation) => operation(request) });
     const toArchive = selectRetention(threads, byPath, now, record.retention.idleDays);
     if (toArchive.length && !bin) log.push(`cannot archive: no Codex binary matches ${record.codexBinaryGlob}`);
     for (const t of bin ? toArchive : []) {
       try {
-        execFileSync(bin, ['archive', t.id], { env: { ...process.env, CODEX_HOME: record.home, CODEX_SQLITE_HOME: join(record.home, 'sqlite') }, stdio: 'ignore' });
+        await request('thread/archive', { threadId: t.id });
         log.push(`archived ${t.id} (${MB(t.bytes)})`);
       } catch {
         // A sub-agent thread is archived with its parent; its own archive then fails. Done if its log left.
@@ -611,6 +630,7 @@ export async function apply(record, scope, { script, parameters }, ports = {}) {
       renameSync(f.path, dest);
       log.push(`moved legacy ${relative(record.home, f.path)}`);
     }
+    });
   }
 
   if (want('scratch') && record.scratch) {

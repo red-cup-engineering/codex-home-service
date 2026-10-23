@@ -266,6 +266,7 @@ test('timer-only installation atomically copies exact selected files and keeps t
     const script = join(source, 'scripts/codex-home.mjs'), parameters = join(root, 'record.json');
     writeFileSync(join(source, 'package.json'), '{"name":"fixture"}\n');
     writeFileSync(join(source, 'src/codex-home.mjs'), '// exact-source\n');
+    writeFileSync(join(source, 'src/thread-provider.mjs'), '// exact-native-provider\n');
     writeFileSync(script, '// exact-cli\n');
     const selected = { installDir: installed, node: '/native/node', retention: { onCalendar: 'hourly', onBootDelay: '15min' }, headroom: { maintenanceReferral: 'existing WSL owner', legacyMaintenance: { guix: '/inactive-provenance' } } };
     writeFileSync(parameters, JSON.stringify(selected));
