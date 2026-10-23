@@ -4,7 +4,7 @@
 import {
   readFileSync, writeFileSync, existsSync, lstatSync, statSync, readdirSync, mkdirSync, renameSync,
   copyFileSync, mkdtempSync, rmSync, readlinkSync, symlinkSync, statfsSync,
-  openSync, closeSync, fsyncSync,
+  openSync, closeSync, fsyncSync, realpathSync,
 } from 'node:fs';
 import { join, dirname, relative, resolve } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
@@ -308,19 +308,50 @@ export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimi
  * A git checkout in scratch may go only when clean and with every commit on a remote (CH-16), or, for a linked
  * worktree whose repository lies outside the scratch `entry`, on a branch that removing the entry leaves (CH-21).
  */
-export function checkoutState(root, entry = root) {
+export function checkoutState(root, entry = root, { protectedRoots = [], budget = { deadline: performance.now() + 5000 }, childTimeoutMs = 500 } = {}) {
+  const held = (reason, common = null) => ({ path: root, ok: false, reason, common });
+  const contains = (parent, child) => { const r = relative(parent, child); return !r || (r !== '..' && !r.startsWith('../') && !r.startsWith('/')); };
+  let realRoot, realEntry;
+  try {
+    realRoot = realpathSync(root); realEntry = realpathSync(entry);
+    if (!contains(realEntry, realRoot) || protectedRoots.some(p => contains(realRoot, realpathSync(p))))
+      return held('checkout scope is outside scratch or protects a home/workspace');
+  } catch { return held('checkout scope is unknown'); }
+  if (!Number.isInteger(childTimeoutMs) || childTimeoutMs < 1 || childTimeoutMs > 500 || !Number.isFinite(budget.deadline))
+    return held('checkout read budget is invalid');
   const dotGit = join(root, '.git');
   const gitdir = gitDirOf(dotGit);
   if (!gitdir) return { path: root, ok: true, reason: 'git metadata already gone', common: null };
   const common = existsSync(join(gitdir, 'commondir')) ? resolve(gitdir, readText(join(gitdir, 'commondir')).trim()) : gitdir;
-  const git = (...args) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_LAZY_FETCH: '1' };
+  for (const name of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG|CONFIG_PARAMETERS|CONFIG_COUNT|CONFIG_KEY_.*|CONFIG_VALUE_.*|TRACE.*|EXEC_PATH)$/.test(name)) delete env[name];
+  const prefix = ['--no-pager', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.untrackedCache=false', '-c', 'core.preloadIndex=false', '-c', 'submodule.recurse=false', '-C', realRoot];
+  const git = (args, allowEmpty = false) => {
+    const left = Math.floor(budget.deadline - performance.now());
+    if (left < 1) throw new Error('checkout read budget exhausted');
+    try {
+      return execFileSync('git', [...prefix, ...args], { encoding: 'utf8', env, timeout: Math.min(childTimeoutMs, left),
+        killSignal: 'SIGKILL', maxBuffer: 65536, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      if (allowEmpty && error.status === 1 && !error.signal && error.stdout?.length === 0 && !error.stderr?.length) return '';
+      throw error;
+    }
+  };
   try {
-    if (git('status', '--porcelain', '--untracked-files=normal')) return { path: root, ok: false, reason: 'uncommitted changes', common };
+    if (realpathSync(git(['rev-parse', '--show-toplevel']).trim()) !== realRoot) return held('native checkout scope differs', common);
+    // Filters can spawn unbounded descendants; partial clones can fetch. Neither
+    // is a read-only bounded scratch proof, even when its parent Git is timed out.
+    if (git(['config', '--get-regexp', '^(filter\\..*\\.(clean|process)|extensions\\.partialclone|remote\\..*\\.promisor)$'], true))
+      return held('checkout filters or partial-clone effects are unreceived', common);
+    if (git(['ls-files', '--stage', '-z']).split('\0').some(row => row.startsWith('160000 ')))
+      return held('submodule checkout proof is unknown', common);
+    if (git(['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignore-submodules=all', '--no-renames'])) return { path: root, ok: false, reason: 'uncommitted changes', common };
     const outside = !`${common}/`.startsWith(`${resolve(entry)}/`);
-    if (git('rev-list', '-n', '1', 'HEAD', '--not', '--remotes', ...(outside ? ['--branches'] : []))) {
+    if (git(['rev-list', '-n', '1', 'HEAD', '--not', '--remotes', ...(outside ? ['--branches'] : [])])) {
       return { path: root, ok: false, reason: outside ? 'commits on no remote or branch' : 'commits on no remote', common };
     }
-  } catch { return { path: root, ok: false, reason: 'unreadable checkout', common }; }
+  } catch { return held('checkout proof is unknown or exceeded its read budget', common); }
   return { path: root, ok: true, reason: 'clean and pushed', common };
 }
 
@@ -374,26 +405,47 @@ export function scratchLimit(record, headroom) {
 }
 
 /** Every top-level entry under each scratch root, measured and decided (CH-16). */
-export function observeScratch(record, now = Date.now(), { idleMs = record.scratch?.idleDays * DAY_MS } = {}) {
+export function scratchRetirementOwners(record) {
+  return (record.scratch?.roots ?? []).map(root => {
+    if (!Object.hasOwn(root, 'retirementOwner')) return null;
+    const value = root.retirementOwner;
+    let url;
+    try { url = new URL(value); } catch { throw new TypeError('canonical HTTPS scratch retirement owner required'); }
+    if (typeof value !== 'string' || value.length > 2048 || url.href !== value || url.protocol !== 'https:'
+        || url.username || url.password || url.search || url.hash || url.pathname === '/')
+      throw new TypeError('canonical HTTPS scratch retirement owner required');
+    return value;
+  });
+}
+
+export function observeScratch(record, now = Date.now(), { idleMs = record.scratch?.idleDays * DAY_MS, readRootEntries = readdirSync } = {}) {
   const s = record.scratch;
   if (!s) return [];
+  const owners = scratchRetirementOwners(record);
   const cutoffMs = now - idleMs;
-  const open = openPaths(), mounts = mountPoints(), opaque = new Set(s.opaqueDirs ?? []);
+  const active = owners.some(owner => !owner);
+  const open = active ? openPaths() : [], mounts = active ? mountPoints() : [], opaque = new Set(s.opaqueDirs ?? []);
+  const budget = { deadline: performance.now() + 5000 };
+  const protectedRoots = [record.home, ...(record.workspaces ?? []).map(ws => ws.path)].filter(Boolean);
   const admits = (root, name) => !root.match || new RegExp(root.match).test(name);
-  return s.roots.flatMap((root) => (existsSync(root.path) ? readdirSync(root.path) : []).filter((name) => admits(root, name)).map((name) => {
+  return s.roots.flatMap((root, index) => {
+    if (owners[index]) return [{ root: root.path, name: '', path: root.path, expire: false, retirementOwner: owners[index], reason: 'retirement delegated to ' + owners[index] }];
+    return (existsSync(root.path) ? readRootEntries(root.path) : []).filter((name) => admits(root, name)).map((name) => {
     const path = join(root.path, name);
     const e = { root: root.path, name, path, declaredKeep: (root.keep ?? []).includes(name), mount: under(mounts, path), inUse: under(open, path) };
     let activity = { newestMs: 0, recent: false, complete: true, repos: [] }, checkouts = [];
     if (!e.declaredKeep && !e.mount && !e.inUse) {
       activity = scratchActivity(path, cutoffMs, { opaque });
-      if (activity.complete && !activity.recent) checkouts = activity.repos.map((repo) => checkoutState(repo, path));
+      if (activity.complete && !activity.recent) checkouts = activity.repos.map((repo) => checkoutState(repo, path, { protectedRoots, budget }));
     }
     const full = { ...e, activity, checkouts };
     return { ...full, ...decideScratch(full) };
-  }));
+    });
+  });
 }
 
 export async function observe(record, { script, parameters }) {
+  scratchRetirementOwners(record);
   const items = [];
   const add = (id, ok, detail) => items.push({ id, status: ok ? 'current' : 'drift', detail });
   const now = Date.now();
@@ -500,6 +552,7 @@ function writeIfChanged(path, text, log, label) {
 }
 
 export async function apply(record, scope, { script, parameters }, ports = {}) {
+  scratchRetirementOwners(record);
   const log = [];
   const scopes = String(scope).split(',');
   const want = (s) => scopes.includes('all') || scopes.includes(s);

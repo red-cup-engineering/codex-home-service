@@ -38,6 +38,44 @@ parameters (operations record) --plan--> items {current | drift, measured}
 
 ## Parameter record
 
+### Bounded checkout proof and delegated retirement (2026-10-23)
+
+The ordinary health plan previously blocked for several minutes inside an
+unbounded native `git status --untracked-files=normal`. It also treated old
+deployment-engine runtime/source/agency entries as generic age-expirable even
+when a received release still referenced their original composition. Neither an
+age nor an apparently clean source tree is lifecycle authority for that data.
+
+Checkout proof remains with native Git. It first binds the exact real scratch
+checkout and native top-level identity, rejecting ancestor/cross-root discovery
+and the record's home/workspace roots. Each child has a 500 ms timeout, a 64 KiB
+output cap, SIGKILL on deadline and native child reaping; all checkout queries in
+one scratch observation share a five-second monotonic budget. The child receives
+no inherited alternate Git directory/index/config/trace bindings. Command-line
+configuration disables optional index locks, filesystem monitors, hooks,
+untracked caches, index preloading and submodule recursion. A bounded index read
+refuses submodule-bearing or oversized checkouts before status. Ordinary small
+isolated checkouts still use native untracked status and native reachability;
+timeout, excess output or uncertain scope holds the entry. There is no added
+directory catalogue, index refresh or whole-workspace fallback.
+
+Each existing `scratch.roots` declaration may instead carry `retirementOwner`,
+a canonical HTTPS service URL with a nonempty path and no credentials, query or
+fragment. Validation runs before observation effects or timer installation.
+That root contributes one held summary naming the existing owner and is never
+listed or passed into activity/Git/removal logic. Delegating a deployment root
+holds all its current and unknown children without enumerating versions; its
+original owner's retained lifecycle receipt remains the reopening contract.
+The operations record owns the actual delegation; source code embeds no host,
+deployment version or per-task retention exception. No timer is activated by
+this source repair.
+
+Receiving includes original clean/untracked/unpushed and linked-worktree cases,
+actual native timeout/reaping and output bounds, protected/ancestor refusal,
+native index/monitor nonmutation, and a delegated root containing both a live
+composition and an unknown child. Observation and scratch-only apply preserve
+both, with an explicit no-list boundary and malformed-identity refusal.
+
 `codex-home-parameters@1`: `home`, `windowsProfileCodexDir` (as mounted in Linux), `windowsProfileCodexDirWindowsPath`, `homeWindowsPath`, `codexBinaryGlob`, `node`, `shellRc`, `loginProfile`, `installDir`, `retention` (`idleDays`, `legacyDir`, `searchedSoftLimitBytes`, `schedule`), `workspaces[]` (`path`, `excludes[]`), `disabledPluginMcpServers[]` (`plugin`, `server`), `scratch` (`idleDays`, `opaqueDirs[]`, `roots[]` with `path`, `keep[]`, `match`), `headroom` (`vmVolume`, `hostVolume`, `diskImage`, `floorBytes`, `idleHours`, `compactAboveBytes`, `maintenanceReferral`, inactive `legacyMaintenance` provenance), and free provenance fields (`observed-*`).
 
 ## Residual work
