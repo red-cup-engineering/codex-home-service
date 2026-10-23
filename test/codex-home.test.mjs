@@ -198,7 +198,7 @@ test('a checkout holds its scratch entry until it is clean and every commit is o
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('headroom is low when either side of the disk image is under the floor; slack asks for compaction (CH-18, CH-19)', () => {
+test('headroom is low on either side; the logical gap retains only a maintenance referral (CH-18, CH-19)', () => {
   const h = { floorBytes: 100, compactAboveBytes: 50 };
   assert.deepEqual(judgeHeadroom({ vmFree: 500, vmUsed: 400, hostFree: 10, imageBytes: 540 }, h), { low: true, slack: 140, compact: true });
   assert.deepEqual(judgeHeadroom({ vmFree: 500, vmUsed: 400, hostFree: 200, imageBytes: 420 }, h), { low: false, slack: 20, compact: false });

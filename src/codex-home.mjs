@@ -345,7 +345,8 @@ export function refuseAutomaticCollection(record) {
 }
 const GB = (b) => `${(b / 1e9).toFixed(1)} GB`;
 
-/** Low when either side of the disk image is under the floor; `slack` is what the image holds beyond the VM's use. */
+/** Low when either side is under the floor. Legacy `slack`/`compact` fields
+ * describe an apparent logical gap/referral, never allocation or reclaim. */
 export function judgeHeadroom({ vmFree, vmUsed, hostFree, imageBytes }, h) {
   if (!Number.isFinite(h.floorBytes) || h.floorBytes <= 0) throw new Error('finite positive housekeeping floor required');
   const slack = imageBytes == null ? null : Math.max(0, imageBytes - vmUsed);
@@ -436,7 +437,7 @@ export async function observe(record, { script, parameters }) {
     add('CH-18 headroom', headroom.low === false,
       `VM ${GB(headroom.vmFree)} free, host ${headroom.hostFree == null ? 'unread' : `${GB(headroom.hostFree)} free`} (floor ${GB(h.floorBytes)})`);
     add('CH-19 disk image', !headroom.compact, headroom.slack == null ? `${h.diskImage} unread; HELD maintenance: ${maintenanceReferral(record)}`
-      : `${GB(headroom.imageBytes)} image holds ${GB(headroom.slack)} beyond ${GB(headroom.vmUsed)} used${headroom.compact ? `; HELD maintenance: ${maintenanceReferral(record)}` : ''}`);
+      : `${GB(headroom.imageBytes)} image logical length, ${GB(headroom.slack)} apparent gap beyond ${GB(headroom.vmUsed)} guest used; Windows allocation/reclaim unknown (original WSL host plan)${headroom.compact ? `; HELD maintenance: ${maintenanceReferral(record)}` : ''}`);
   }
   if (record.scratch) {
     let limit;
