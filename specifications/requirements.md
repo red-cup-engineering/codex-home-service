@@ -41,7 +41,7 @@ Each requirement has one shall. Identifiers are stable.
 ## Headroom
 
 - CH-18. While free space on the VM's filesystem or on the host volume that holds the VM's disk image is below the record's `headroom.floorBytes`, the service shall expire scratch entries idle longer than `headroom.idleHours` instead of `idleDays`; unknown pressure shall hold scratch retirement. Automatic Guix collection is outside this service. Measured 2026-10-19: the VM's filesystem reported 490 GB free on its 1 TB virtual disk while the host volume had 1 GB, so a floor read inside the VM alone would never have tripped.
-- CH-19. `plan` shall report the host volume's free space and how much the disk image holds beyond what the VM's filesystem uses, and when that exceeds `headroom.compactAboveBytes` it shall report the existing WSL maintenance owner's held obligation (CH-13); it shall execute no GC or compaction. Mounted-filesystem pressure is advisory, never physical fabrication admission. Measured 2026-10-19: a 542 GiB image on 467 GB used.
+- CH-19. `plan` shall report the host volume's free space and the apparent gap between the disk image's logical length and the VM's filesystem use, and when that exceeds `headroom.compactAboveBytes` it shall report the existing WSL maintenance owner's held obligation (CH-13); it shall execute no GC or compaction. Logical length is not Windows physical allocation or safely reclaimable bytes. The original WSL host plan owns that separate native allocation observation. Mounted-filesystem pressure is advisory, never physical fabrication admission. Measured 2026-10-19: a 542 GiB image on 467 GB used.
 
 ## Configuration
 
@@ -66,4 +66,4 @@ Each requirement has one shall. Identifiers are stable.
 4. The retention timer is listed by `systemctl --user list-timers` and its last run succeeded.
 5. With headroom below the floor, one apply leaves no scratch entry idle longer than `headroom.idleHours` except those CH-16 keeps, and preserves all original Guix roots and pending maintenance custody; no automatic store collection runs.
 
-- CH-23. A legacy active `headroom.guix` selector shall refuse before any scratch/retention effect; a timer-only installation shall copy the exact selected code/record atomically without executing cleanup or maintenance.
+- CH-23. Legacy active `headroom.guix` or `headroom.compactCommand` selectors shall refuse before any scratch/retention effect or timer installation. Inactive `headroom.legacyMaintenance` provenance remains admissible. A timer-only installation shall copy the exact admitted code/record atomically without executing cleanup or maintenance, so an obsolete selection cannot reintroduce a future failing timer record.

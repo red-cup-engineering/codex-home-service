@@ -341,11 +341,12 @@ const under = (paths, p) => paths.some((x) => x === p || x.startsWith(`${p}/`));
 // ---------- CH-18/CH-19 headroom ----------
 export const maintenanceReferral = record => record.headroom?.maintenanceReferral || 'Existing WSL host maintenance owner: exact-disk checkpoint, authority and physical reopening required; no maintenance is admitted here.';
 export function refuseAutomaticCollection(record) {
-  if (record.headroom?.guix) throw new Error('unqualified automatic Guix collection refused before effects; ' + maintenanceReferral(record));
+  if (record.headroom?.guix || record.headroom?.compactCommand) throw new Error('unqualified automatic maintenance selector refused before effects; ' + maintenanceReferral(record));
 }
 const GB = (b) => `${(b / 1e9).toFixed(1)} GB`;
 
-/** Low when either side of the disk image is under the floor; `slack` is what the image holds beyond the VM's use. */
+/** Low when either side is under the floor. Legacy `slack`/`compact` fields
+ * describe an apparent logical gap/referral, never allocation or reclaim. */
 export function judgeHeadroom({ vmFree, vmUsed, hostFree, imageBytes }, h) {
   if (!Number.isFinite(h.floorBytes) || h.floorBytes <= 0) throw new Error('finite positive housekeeping floor required');
   const slack = imageBytes == null ? null : Math.max(0, imageBytes - vmUsed);
@@ -436,7 +437,7 @@ export async function observe(record, { script, parameters }) {
     add('CH-18 headroom', headroom.low === false,
       `VM ${GB(headroom.vmFree)} free, host ${headroom.hostFree == null ? 'unread' : `${GB(headroom.hostFree)} free`} (floor ${GB(h.floorBytes)})`);
     add('CH-19 disk image', !headroom.compact, headroom.slack == null ? `${h.diskImage} unread; HELD maintenance: ${maintenanceReferral(record)}`
-      : `${GB(headroom.imageBytes)} image holds ${GB(headroom.slack)} beyond ${GB(headroom.vmUsed)} used${headroom.compact ? `; HELD maintenance: ${maintenanceReferral(record)}` : ''}`);
+      : `${GB(headroom.imageBytes)} image logical length, ${GB(headroom.slack)} apparent gap beyond ${GB(headroom.vmUsed)} guest used; Windows allocation/reclaim unknown (original WSL host plan)${headroom.compact ? `; HELD maintenance: ${maintenanceReferral(record)}` : ''}`);
   }
   if (record.scratch) {
     let limit;
@@ -502,9 +503,9 @@ export async function apply(record, scope, { script, parameters }, ports = {}) {
   const log = [];
   const scopes = String(scope).split(',');
   const want = (s) => scopes.includes('all') || scopes.includes(s);
-  // All preconditions precede retention, scratch or any other effect. The
-  // timer-only installer deliberately admits no maintenance or cleanup scope.
-  if (want('scratch') || want('retention')) refuseAutomaticCollection(record);
+  // Reject active legacy maintenance selectors before cleanup OR installing
+  // them as the future timer's record. Timer installation executes no cleanup.
+  if (want('scratch') || want('retention') || want('timer')) refuseAutomaticCollection(record);
   if (want('scratch')) {
     scratchLimit(record, observeHeadroom(record));
   }
