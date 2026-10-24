@@ -1,6 +1,6 @@
 {
   "name": "@red-cup-engineering/codex-home-service",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Keeps a Codex home's placement, login link, searched data, workspace scans and plugin servers bounded, from one parameter record.",
   "files": [

@@ -38,6 +38,18 @@ test('record-owned harness apply selects the common controller and dry-run creat
 });
 
 
+test('the owning record selects containment installation and keeps dry-run free of effects',async t=>{
+ const root=fixture(t),source=fileURLToPath(new URL('../../../../../src/host-resource-hook.mjs',import.meta.url));
+ const installer=join(root,'selected-installer.mjs'),effect=join(root,'native-containment-received');
+ fs.writeFileSync(installer,`import{writeFileSync}from'node:fs';export function installContainment({dryRun}){if(!dryRun)writeFileSync(${JSON.stringify(effect)},'received');return{changed:dryRun,workUnit:${JSON.stringify(join(root,'agent-work.slice'))},reloaded:!dryRun}}`);
+ const record={harnessResources:{source,containmentInstaller:installer,workspaces:[{path:root,providers:['claude','codex']}]}};
+ const planned=await reconcileHarnessResources(record,{dryRun:true});
+ assert.equal(planned[0].containment.changed,true);assert.equal(fs.existsSync(effect),false);
+ const applied=await reconcileHarnessResources(record);
+ assert.equal(applied[0].containment.reloaded,true);assert.equal(fs.readFileSync(effect,'utf8'),'received');
+ assert.equal(applied[0].activeSessionGuarded,false);assert.equal(applied[0].codexTrustRequired,true);
+});
+
 test('the existing timer reconciles selected provider registrations without changing cadence',()=>{
  const record={node:'/node',retention:{onCalendar:'hourly',onBootDelay:'15min'},scratch:{roots:[]},harnessResources:{source:'/owner'}};
  const units=renderTimerUnits(record,'/installed/service','/record');
