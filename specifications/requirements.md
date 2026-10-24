@@ -80,3 +80,9 @@ Leader, 2026-10-23: "these giant disc-reads are KILLING our system" and "Where i
 - CH-29. When harnessResources is selected, the existing retention schedule shall reconcile those exact provider registrations at its unchanged cadence, preserving unrelated hooks and provider trust.
 
 Leader, 2026-10-23: "We shuoldn't have any sqlite or sql anywhere lol". CH-27 replaces direct private-storage access with the provider-owned thread/list and thread/archive protocol. The house service imports no SQL driver, issues no SQL and owns no provider database. Vendor internals remain vendor-owned; deleting or rewriting them is not a migration.
+
+### Effective parent budget for shared containment
+
+CH-27. A record-selected containment installer shall be reconciled by harness apply and its existing timer, with dry-run free of effects and active provider trust reported separately.
+
+Shared work containment uses the destination user manager's effective memory allocation. A 12GiB VM with user.slice at4GiB previously received work high5552209920/max7402946560 from VM fractions, so a3.4GiB npm process throttled the parent and prevented its900-second timeout from completing termination for37minutes. The existing harness now reads only memory.high/memory.max of the four known destination ancestors and takes their minimum with physical memory before applying its unchanged45%/60% shares. Bare Cedar Fog therefore declares work high1843M/max2457M within the received4GiB parent. Session protection, heavy slots, CPU/I/O weights, zero work swap and provider trust remain under their existing owners. Codex-home's record explicitly selects the existing shared containment installer; its harness apply and scheduled reconciliation install the same units instead of merely refreshing hook references. Dry-run has no installation effects; source-reference registration alone is not a claim of active provider enforcement.

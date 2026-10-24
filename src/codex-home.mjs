@@ -455,6 +455,9 @@ export async function observe(record, { script, parameters }) {
       const results = await reconcileHarnessResources(record, { dryRun: true });
       for (const result of results) add(`CH-26 harness ${result.workspace}`, result.written.length === 0,
         `${result.written.length ? `drift: ${result.written.join(', ')}` : 'source references current'}; active session enforcement unverified${result.codexTrustRequired ? '; Codex trust remains provider-owned' : ''}`);
+      const containment = results.find(result => result.containment)?.containment;
+      if (containment) add('CH-27 harness containment', !containment.changed,
+        `shared work-slice declaration ${containment.workUnit}; active provider enforcement remains unverified`);
     } catch (error) { add('CH-26 harness resources', false, error.message); }
   }
 
@@ -542,8 +545,15 @@ export async function reconcileHarnessResources(record, { dryRun = false } = {})
     if (typeof workspace.path !== 'string' || !workspace.path.startsWith('/') || !workspace.providers?.length || workspace.providers.some(p => !['claude', 'codex'].includes(p))) throw new Error('invalid harness resource workspace');
   }
   const { writeHostResourceControl } = await import(pathToFileURL(selected.source).href);
-  return selected.workspaces.map(workspace => ({ workspace: workspace.path,
+  const results = selected.workspaces.map(workspace => ({ workspace: workspace.path,
     ...writeHostResourceControl({ node: workspace.path, providers: workspace.providers, retiredSources: selected.retiredSources ?? [], dryRun }) }));
+  if (selected.containmentInstaller && results.length) {
+    if (typeof selected.containmentInstaller !== 'string' || !selected.containmentInstaller.startsWith('/')) throw new Error('harnessResources containmentInstaller needs its absolute owning source');
+    const { installContainment } = await import(pathToFileURL(selected.containmentInstaller).href);
+    if (typeof installContainment !== 'function') throw new Error('selected harness installer lacks its native containment operation');
+    results[0].containment = installContainment({ dryRun });
+  }
+  return results;
 }
 
 function writeInstalled(path, text, log) {
@@ -572,7 +582,10 @@ export async function apply(record, scope, { script, parameters }, ports = {}) {
   const scopes = String(scope).split(',');
   const want = (s) => scopes.includes('all') || scopes.includes(s);
   if (want('harness')) {
-    for (const result of await reconcileHarnessResources(record)) for (const file of result.written) log.push(`harness source reference ${join(result.workspace, file)}`);
+    for (const result of await reconcileHarnessResources(record)) {
+      for (const file of result.written) log.push(`harness source reference ${join(result.workspace, file)}`);
+      if (result.containment?.changed) log.push(`harness containment reconciled ${result.containment.workUnit}`);
+    }
   }
   // Reject active legacy maintenance selectors before cleanup OR installing
   // them as the future timer's record. Timer installation executes no cleanup.
