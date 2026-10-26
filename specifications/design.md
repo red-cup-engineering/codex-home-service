@@ -1,5 +1,18 @@
 # Codex home service: design
 
+## Scheduled execution receiving (CH-36)
+
+The existing health plan reads only seven named fields from the original
+`codex-home-retention.service`, with a five-second and 16 KiB native read bound.
+It reports execution independently of the timer, unit text and installed-copy
+checks. A failed result remains drift even when the timer is enabled. The
+service's declared success exits 0 and 2 count only after a completed run;
+exit 2 retains its existing meaning of unresolved plan drift. A live process
+is reported as running, never completed. Missing, partial, repeated or
+malformed fields and an unobserved first run remain unknown. The observation
+does not start the service or inspect scratch. Scoped timer installation stays
+under this owner's existing atomic installed-copy and unit reconciliation.
+
 ## Theory
 
 The Codex desktop app in WSL mode is a Windows process driving a Linux app-server. Three of its built-in operations read whole data sets on every use: the thread search (`rg` over every conversation log, per query), the per-turn git snapshot of the workspace (every untracked file), and the startup walk of the home's plugins and skills. Their cost is proportional to the size of what they read and to the cost per file of the filesystem it lives on. On WSL2 a Linux process reading the Windows drive goes through 9P, where per-file operations cost milliseconds (Microsoft, "Working across file systems": store project files on the Linux file system for performance).

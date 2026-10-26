@@ -38,6 +38,10 @@ Each requirement has one shall. Identifiers are stable.
 - CH-20. CH-16's idle check shall not descend into the directories the record names in `scratch.opaqueDirs`, whose own change time still counts. Measured 2026-10-19: one runtime's installed dependencies were ~77,000 files, so an entry holding a few runtimes passed the check's directory limit and was kept as "too large to prove idle" for good.
 - CH-21. For CH-16, a linked worktree whose commits are all on branches of a repository outside its scratch entry shall count as pushed, because removing the entry leaves those branches in place.
 
+## Scheduled execution receiving
+
+- CH-36. `plan` shall separately observe the original retention service's current or last execution through one bounded native systemd read. An enabled timer, current unit text or current installed files shall not establish successful scheduled execution. A failed, missing, malformed or never-completed service observation shall report drift; a current process shall be distinguished from a completed run. The declared success exit 2 means the scopes ran with remaining plan drift, not that every machine obligation is resolved. This observation shall execute no retention, scratch scan, restart or retirement.
+
 ## Headroom
 
 - CH-18. While free space on the VM's filesystem or on the host volume that holds the VM's disk image is below the record's `headroom.floorBytes`, the service shall expire scratch entries idle longer than `headroom.idleHours` instead of `idleDays`; unknown pressure shall hold scratch retirement. Automatic Guix collection is outside this service. Measured 2026-10-19: the VM's filesystem reported 490 GB free on its 1 TB virtual disk while the host volume had 1 GB, so a floor read inside the VM alone would never have tripped.

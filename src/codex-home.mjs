@@ -275,6 +275,43 @@ const INSTALLED = ['package.json', 'src/codex-home.mjs', 'src/thread-provider.mj
 export function installedPaths(record) {
   return { script: join(record.installDir, 'scripts', 'codex-home.mjs'), parameters: join(record.installDir, 'codex-home.json') };
 }
+
+/** CH-36: an enabled timer is not evidence that its scheduled work succeeded. */
+export function retentionExecutionState(text) {
+  const unknown = { current: false, state: 'unobserved', detail: 'scheduled service result unavailable or incomplete' };
+  if (typeof text !== 'string' || Buffer.byteLength(text) > 16384) return unknown;
+  const fields = new Map();
+  const names = ['LoadState', 'ActiveState', 'SubState', 'Result', 'ExecMainStatus', 'ExecMainExitTimestampMonotonic', 'MainPID'];
+  for (const line of text.trim().split('\n')) {
+    const at = line.indexOf('=');
+    if (at < 1) return unknown;
+    const key = line.slice(0, at), value = line.slice(at + 1);
+    if (!names.includes(key) || fields.has(key) || value.length > 256) return unknown;
+    fields.set(key, value);
+  }
+  if (fields.size !== names.length || fields.get('LoadState') !== 'loaded'
+      || !['ExecMainStatus', 'ExecMainExitTimestampMonotonic', 'MainPID'].every(key => /^\d{1,20}$/u.test(fields.get(key)))) return unknown;
+  const active = fields.get('ActiveState'), sub = fields.get('SubState'), result = fields.get('Result');
+  if (active === 'failed' || result !== 'success') return {
+    current: false, state: 'failed', detail: `scheduled service ${active}/${sub}, result ${result}, exit ${fields.get('ExecMainStatus')}`,
+  };
+  if (['active', 'activating'].includes(active) && BigInt(fields.get('MainPID')) > 0n) return {
+    current: true, state: 'running', detail: `scheduled service ${active}/${sub}; current execution has not settled`,
+  };
+  if (active === 'inactive' && sub === 'dead' && fields.get('MainPID') === '0'
+      && ['0', '2'].includes(fields.get('ExecMainStatus')) && BigInt(fields.get('ExecMainExitTimestampMonotonic')) > 0n) return {
+    current: true, state: 'completed', detail: `last scheduled execution succeeded (exit ${fields.get('ExecMainStatus')}); remaining plan drift is separate`,
+  };
+  return unknown;
+}
+
+function readRetentionExecution() {
+  try {
+    return retentionExecutionState(execFileSync('systemctl', ['--user', 'show', 'codex-home-retention.service',
+      '--property=LoadState,ActiveState,SubState,Result,ExecMainStatus,ExecMainExitTimestampMonotonic,MainPID', '--no-pager'],
+    { encoding: 'utf8', env: userManagerEnv(), timeout: 5000, maxBuffer: 16384, stdio: ['ignore', 'pipe', 'ignore'] }));
+  } catch { return retentionExecutionState(null); }
+}
 function installPlan(record, { script, parameters }) {
   const root = dirname(dirname(script));
   return [
@@ -634,6 +671,8 @@ export async function observe(record, { script, parameters }) {
   try { enabled = systemctlUser('is-enabled', 'codex-home-retention.timer'); } catch { enabled = 'disabled'; }
   const unitsOk = svc === units.service && tmr === units.timer;
   add('CH-7 retention timer', unitsOk && enabled === 'enabled', `units ${unitsOk ? 'current' : 'differ'}, ${enabled}`);
+  const execution = readRetentionExecution();
+  add('CH-36 retention execution', execution.current, execution.detail);
   const copies = installPlan(record, { script, parameters });
   add('CH-14 installed copy', copies.every((c) => readText(c.from) === readText(c.to)), record.installDir);
   return items;
