@@ -52,7 +52,7 @@ test('native read-only status does not run a monitor or modify its index',()=>{
  assert.equal(checkoutState(root).reason,'commits on no remote');
  assert.equal(fs.existsSync(marker),false);assert.deepEqual(fs.readFileSync(index),before);assert.equal(fs.statSync(index).mtimeMs,mtime);
  git(root,'config','filter.unreceived.clean','unreceived-filter-command');
- assert.match(checkoutState(root).reason,/filters or partial-clone/);
+ assert.match(checkoutState(root).reason,/filters are unreceived/);
 });
 
 test('submodule index and exhausted aggregate budget hold instead of recursively probing',()=>{
