@@ -42,11 +42,26 @@ export function withoutManagedBlock(text) {
   return start >= 0 && end > start ? [...all.slice(0, start), ...all.slice(end + 1)].join('\n') : text;
 }
 
+/** CH-30: absolute directories with no characters a shell would read as syntax; refused otherwise. */
+export function shellPathDirectories(record) {
+  const dirs = record.shellPath ?? [];
+  if (!Array.isArray(dirs) || !dirs.every((d) => typeof d === 'string' && /^\/[A-Za-z0-9_@%+=,.\/-]*$/u.test(d) && !d.includes('//') && d !== '/')) {
+    throw new Error('shellPath must be a list of absolute directories made of letters, digits and _@%+=,./-');
+  }
+  return [...new Set(dirs)];
+}
+
 export function shellRcLines(record) {
+  const dirs = shellPathDirectories(record);
   return [
     '# The Codex home lives on the Linux filesystem only; a home on /mnt/* (the Windows bridge) made every',
     '# Codex start take minutes (observed-2026-10-14 in the record). Kept last so nothing above overrides it.',
     `export CODEX_HOME="${record.home}"`,
+    ...(dirs.length === 0 ? [] : [
+      '# Directories of the record\'s shellPath, ahead of the system ones (each added once, however many shells nest).',
+      ...dirs.toReversed().map((d) => `case ":$PATH:" in *":${d}:"*) ;; *) PATH="${d}:$PATH" ;; esac`),
+      'export PATH',
+    ]),
   ];
 }
 

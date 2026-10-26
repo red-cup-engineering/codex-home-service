@@ -36,6 +36,18 @@ test('managed block is replaced in place and owner lines survive', () => {
 
 test('shell block exports the record home (CH-1)', () => {
   assert.ok(shellRcLines(record).includes('export CODEX_HOME="/h/.codex"'));
+  assert.ok(!shellRcLines(record).some((line) => line.includes('PATH')), 'no shellPath, no PATH line');
+});
+
+test('shellPath puts the record\'s directories ahead of the system ones, once, in order (CH-30)', () => {
+  const lines = shellRcLines({ ...record, shellPath: ['/a/shims', '/b/bin'] });
+  assert.ok(lines.some((l) => l.includes('PATH="/a/shims:$PATH"')) && lines.some((l) => l.includes('PATH="/b/bin:$PATH"')));
+  const script = ['PATH=/usr/bin:/bin', ...lines, 'echo "$PATH"', ...lines, 'echo "$PATH"'].join('\n');
+  const out = execFileSync('sh', ['-c', script], { encoding: 'utf8' }).trim().split('\n');
+  assert.deepEqual(out, ['/a/shims:/b/bin:/usr/bin:/bin', '/a/shims:/b/bin:/usr/bin:/bin'], 'sourced twice, still one entry each, first listed first');
+  for (const bad of [['relative'], ['/a b'], ['/a;rm'], ['/a"'], ['/a$HOME'], ['/'], ['/a//b'], [1], 'x']) {
+    assert.throws(() => shellRcLines({ ...record, shellPath: bad }), /shellPath must be/u, JSON.stringify(bad));
+  }
 });
 
 // Ubuntu's startup files as they stand on the host: ~/.profile sources ~/.bashrc, which returns early when not interactive.
