@@ -126,6 +126,7 @@ export function decideScratch(e) {
   if (e.declaredKeep) return { expire: false, reason: 'kept by the record' };
   if (e.mount) return { expire: false, reason: 'a filesystem is mounted inside' };
   if (e.inUse) return { expire: false, reason: 'open in a running process' };
+  if (e.liveSession) return { expire: false, reason: 'belongs to a running session' };
   if (!e.activity.complete) return { expire: false, reason: 'too large to prove idle' };
   if (e.activity.recent) return { expire: false, reason: 'active' };
   const held = e.checkouts.find((c) => !c.ok);
@@ -287,6 +288,32 @@ const MB = (b) => `${(b / 1e6).toFixed(0)} MB`;
 const SCRATCH_DEPTH = 8;
 const SCRATCH_DIR_LIMIT = 256;
 
+// CH-34: what one scratch apply may spend proving entries idle. The defaults are the original aggregate limits
+// (applied per entry); the record may widen them, within the maxima, from what its host measured.
+const PROOF_DEFAULTS = Object.freeze({ entryReads: 1024, entryDirs: SCRATCH_DIR_LIMIT, entryMs: 250, totalMs: 250, checkoutMs: 5000 });
+const PROOF_MAXIMA = Object.freeze({ entryReads: 1_000_000, entryDirs: 1_000_000, entryMs: 10_000, totalMs: 120_000, checkoutMs: 120_000 });
+export function scratchProofBudget(record, root = null) {
+  const out = { ...PROOF_DEFAULTS };
+  const take = (declared, keys, where) => {
+    if (typeof declared !== 'object' || declared === null || Array.isArray(declared)) throw new TypeError(`${where} must be an object`);
+    for (const [key, value] of Object.entries(declared)) {
+      if (!keys.includes(key) || !Number.isSafeInteger(value) || value < 1 || value > PROOF_MAXIMA[key])
+        throw new TypeError(`${where} admits ${keys.join(', ')} as integers from 1 to their maxima (${keys.map((k) => `${k} ${PROOF_MAXIMA[k]}`).join(', ')})`);
+      out[key] = value;
+    }
+  };
+  take(record.scratch?.proofBudget ?? {}, Object.keys(PROOF_DEFAULTS), 'scratch proofBudget');
+  // A root may widen only what one of its entries may spend; the run's time and git budgets are the record's alone.
+  if (root) take(root.proofBudget ?? {}, ['entryReads', 'entryDirs', 'entryMs'], 'scratch root proofBudget');
+  return out;
+}
+/** The record's scratch declarations (CH-25, CH-33, CH-34), all refused when any one is malformed. */
+export function validateScratch(record) {
+  scratchRetirementOwners(record);
+  scratchLiveSessionFlags(record);
+  for (const root of [null, ...(record.scratch?.roots ?? [])]) scratchProofBudget(record, root);
+}
+
 /** The git directory a `.git` entry names: itself, or the target of a `gitdir:` file (null when that is gone). */
 function gitDirOf(dotGit) {
   const st = lstatOrNull(dotGit);
@@ -355,10 +382,10 @@ export function checkoutState(root, entry = root, { protectedRoots = [], budget 
   const gitdir = gitDirOf(dotGit);
   if (!gitdir) return { path: root, ok: true, reason: 'git metadata already gone', common: null };
   const common = existsSync(join(gitdir, 'commondir')) ? resolve(gitdir, readText(join(gitdir, 'commondir')).trim()) : gitdir;
-  const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_LAZY_FETCH: '1' };
+  const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
   for (const name of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG|CONFIG_PARAMETERS|CONFIG_COUNT|CONFIG_KEY_.*|CONFIG_VALUE_.*|TRACE.*|EXEC_PATH)$/.test(name)) delete env[name];
   const prefix = ['--no-pager', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
-    '-c', 'core.untrackedCache=false', '-c', 'core.preloadIndex=false', '-c', 'submodule.recurse=false', '-C', realRoot];
+    '-c', 'core.untrackedCache=false', '-c', 'core.preloadIndex=false', '-c', 'submodule.recurse=false', '-c', 'protocol.allow=never', '-C', realRoot];
   const git = (args, allowEmpty = false) => {
     const left = Math.floor(budget.deadline - performance.now());
     if (left < 1) throw new Error('checkout read budget exhausted');
@@ -372,10 +399,11 @@ export function checkoutState(root, entry = root, { protectedRoots = [], budget 
   };
   try {
     if (realpathSync(git(['rev-parse', '--show-toplevel']).trim()) !== realRoot) return held('native checkout scope differs', common);
-    // Filters can spawn unbounded descendants; partial clones can fetch. Neither
-    // is a read-only bounded scratch proof, even when its parent Git is timed out.
-    if (git(['config', '--get-regexp', '^(filter\\..*\\.(clean|process)|extensions\\.partialclone|remote\\..*\\.promisor)$'], true))
-      return held('checkout filters or partial-clone effects are unreceived', common);
+    // Filters can spawn unbounded descendants, which is no read-only bounded proof even when their parent Git is timed
+    // out. A partial clone (the house clones blobless) can fetch, but every git call above runs with all transports
+    // refused, so a read that needs a missing object fails and the checkout stays held instead of fetching (CH-34).
+    if (git(['config', '--get-regexp', '^filter\\..*\\.(clean|process)$'], true))
+      return held('checkout filters are unreceived', common);
     if (git(['ls-files', '--stage', '-z']).split('\0').some(row => row.startsWith('160000 ')))
       return held('submodule checkout proof is unknown', common);
     if (git(['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignore-submodules=all', '--no-renames'])) return { path: root, ok: false, reason: 'uncommitted changes', common };
@@ -400,6 +428,28 @@ function openPaths() {
 }
 const mountPoints = () => readText('/proc/self/mountinfo').split('\n').map((l) => l.split(' ')[4]).filter(Boolean);
 const under = (paths, p) => paths.some((x) => x === p || x.startsWith(`${p}/`));
+
+/**
+ * CH-33: the session ids of the running processes, read from `proc` as the values of the long options in `flags`
+ * (`--session-id=<id>`, `--resume=<id>`, or the option and the id as two arguments). A session's scratch folder is
+ * named by its id, and an open file is only incidental evidence that an idle session is running.
+ */
+export function runningSessionIds(flags, proc = '/proc') {
+  const names = flags.map((f) => f.replace(/=$/, ''));
+  const ids = new Set();
+  for (const pid of readdirSync(proc).filter((d) => /^\d+$/.test(d))) {
+    let argv;
+    try { argv = readFileSync(join(proc, pid, 'cmdline'), 'utf8').split('\0'); } catch { continue; }
+    argv.forEach((arg, i) => {
+      for (const name of names) {
+        if (arg.startsWith(`${name}=`)) ids.add(arg.slice(name.length + 1));
+        else if (arg === name && argv[i + 1]) ids.add(argv[i + 1]);
+      }
+    });
+  }
+  ids.delete('');
+  return ids;
+}
 
 // ---------- CH-18/CH-19 headroom ----------
 export const maintenanceReferral = record => record.headroom?.maintenanceReferral || 'Existing WSL host maintenance owner: exact-disk checkpoint, authority and physical reopening required; no maintenance is admitted here.';
@@ -450,25 +500,48 @@ export function scratchRetirementOwners(record) {
   });
 }
 
-export function observeScratch(record, now = Date.now(), { idleMs = record.scratch?.idleDays * DAY_MS, readRootEntries = readdirSync } = {}) {
+/** Per root, the long options that name a running session whose folder it holds (CH-33), or null. Malformed refuses. */
+export function scratchLiveSessionFlags(record) {
+  return (record.scratch?.roots ?? []).map(root => {
+    if (!Object.hasOwn(root, 'liveSessionFlags')) return null;
+    const flags = root.liveSessionFlags;
+    if (!Array.isArray(flags) || !flags.length || flags.length > 8 || !flags.every(f => typeof f === 'string' && /^--[a-z][a-z0-9-]*=?$/.test(f)))
+      throw new TypeError('scratch liveSessionFlags must list long option names');
+    return flags;
+  });
+}
+
+export function observeScratch(record, now = Date.now(), { idleMs = record.scratch?.idleDays * DAY_MS, readRootEntries = readdirSync, processRoot = '/proc' } = {}) {
   const s = record.scratch;
   if (!s) return [];
-  const owners = scratchRetirementOwners(record);
+  const owners = scratchRetirementOwners(record), sessionFlags = scratchLiveSessionFlags(record);
   const cutoffMs = now - idleMs;
   const active = owners.some(owner => !owner);
   const open = active ? openPaths() : [], mounts = active ? mountPoints() : [], opaque = new Set(s.opaqueDirs ?? []);
-  const budget = { deadline: performance.now() + 5000 };
-  const activityBudget = { deadline: performance.now() + 250, remaining: 1024 };
+  const proof = scratchProofBudget(record), started = performance.now();
+  const rootProof = s.roots.map((root) => scratchProofBudget(record, root));
+  const budget = { deadline: started + proof.checkoutMs };
+  // Each entry is proven within its own reads and time, under one overall deadline, so a large idle entry is held
+  // alone instead of leaving every entry after it unproven in every run (CH-34).
+  const activityBudget = (index) => ({ deadline: Math.min(performance.now() + rootProof[index].entryMs, started + proof.totalMs), remaining: rootProof[index].entryReads });
   const protectedRoots = [record.home, ...(record.workspaces ?? []).map(ws => ws.path)].filter(Boolean);
   const admits = (root, name) => !root.match || new RegExp(root.match).test(name);
+  const running = new Map();   // one /proc read per distinct flag set
+  const runs = (index, name) => {
+    const flags = sessionFlags[index];
+    if (!flags) return false;
+    const key = flags.join(' ');
+    if (!running.has(key)) running.set(key, runningSessionIds(flags, processRoot));
+    return running.get(key).has(name);
+  };
   return s.roots.flatMap((root, index) => {
     if (owners[index]) return [{ root: root.path, name: '', path: root.path, expire: false, retirementOwner: owners[index], reason: 'retirement delegated to ' + owners[index] }];
     return (existsSync(root.path) ? readRootEntries(root.path) : []).filter((name) => admits(root, name)).map((name) => {
     const path = join(root.path, name);
-    const e = { root: root.path, name, path, declaredKeep: (root.keep ?? []).includes(name), mount: under(mounts, path), inUse: under(open, path) };
+    const e = { root: root.path, name, path, declaredKeep: (root.keep ?? []).includes(name), mount: under(mounts, path), inUse: under(open, path), liveSession: runs(index, name) };
     let activity = { newestMs: 0, recent: false, complete: true, repos: [] }, checkouts = [];
-    if (!e.declaredKeep && !e.mount && !e.inUse) {
-      activity = scratchActivity(path, cutoffMs, { opaque, budget: activityBudget });
+    if (!e.declaredKeep && !e.mount && !e.inUse && !e.liveSession) {
+      activity = scratchActivity(path, cutoffMs, { opaque, dirLimit: rootProof[index].entryDirs, budget: activityBudget(index) });
       if (activity.complete && !activity.recent) checkouts = activity.repos.map((repo) => checkoutState(repo, path, { protectedRoots, budget }));
     }
     const full = { ...e, activity, checkouts };
@@ -608,127 +681,173 @@ function writeIfChanged(path, text, log, label) {
   return true;
 }
 
-export async function apply(record, scope, { script, parameters }, ports = {}) {
-  scratchRetirementOwners(record);
+/** Scopes in the order `apply` runs them; each is independent of the others (CH-32). */
+export const APPLY_SCOPES = Object.freeze(['harness', 'placement', 'retention', 'scratch', 'workspace', 'config', 'timer']);
+
+/** A scope's failure, kept with what the other scopes did. */
+export class ApplyFailed extends Error {
+  constructor(log, failures) {
+    super(`apply failed in ${failures.map((f) => f.scope).join(', ')}: ${failures.map((f) => f.error.message).join('; ')}`);
+    this.name = 'ApplyFailed';
+    this.log = log;
+    this.failures = failures;
+  }
+}
+
+/**
+ * CH-32: refuse the record before any effect (legacy maintenance selectors, malformed retirement owners or
+ * session flags: CH-23, CH-25, CH-33), then run each selected scope on its own. One scope's failure is reported
+ * and the others still run. Returns { log: what changed, notes: what was seen and left, failures: [{ scope, error }] }.
+ */
+export async function applyScopes(record, scope, { script, parameters }, ports = {}) {
+  validateScratch(record);
   const log = [];
+  const notes = [];
+  const failures = [];
   const scopes = String(scope).split(',');
   const want = (s) => scopes.includes('all') || scopes.includes(s);
-  if (want('harness')) {
-    for (const result of await reconcileHarnessResources(record)) {
-      for (const file of result.written) log.push(`harness source reference ${join(result.workspace, file)}`);
-      if (result.containment?.changed) log.push(`harness containment reconciled ${result.containment.workUnit}`);
-    }
-  }
   // Reject active legacy maintenance selectors before cleanup OR installing
   // them as the future timer's record. Timer installation executes no cleanup.
   if (want('scratch') || want('retention') || want('timer')) refuseAutomaticCollection(record);
-  if (want('scratch')) {
-    scratchLimit(record, observeHeadroom(record));
-  }
 
-  if (want('placement')) {
-    const rc = readText(record.shellRc);
-    writeIfChanged(record.shellRc, mergeManagedBlock(rc, shellRcLines(record)).text, log, `${record.shellRc} (managed block)`);
-    if (record.loginProfile) writeIfChanged(record.loginProfile, mergeManagedBlock(readText(record.loginProfile), shellRcLines(record)).text, log, `${record.loginProfile} (managed block)`);
-    for (const s of runningAppServerHomes().filter((s) => s.home !== record.home)) log.push(`WINDOWS restart the Codex app: its app-server (pid ${s.pid}) still runs on ${s.home}`);
-    const l = loginState(record);
-    if (!l.ok) {
-      const same = () => existsSync(l.homeAuth) && existsSync(l.winAuth) && readFileSync(l.homeAuth).equals(readFileSync(l.winAuth));
-      if (l.action === 'move-home-to-windows') {
-        const bytes = readFileSync(l.homeAuth);
-        if (lstatOrNull(l.winAuth)) rmSync(l.winAuth);            // a link: removes the link only
-        writeFileSync(l.winAuth, bytes); rmSync(l.homeAuth); symlinkSync(l.winAuth, l.homeAuth);
-        log.push(`moved the login to ${l.winAuth} and linked the home to it`);
-      } else if (l.action === 'link-home' || l.action === 'relink-home' || (l.action === 'link-home-if-identical' && same())) {
-        if (lstatOrNull(l.homeAuth)) rmSync(l.homeAuth);
-        symlinkSync(l.winAuth, l.homeAuth);
-        log.push(`linked ${l.homeAuth} -> ${l.winAuth}`);
-      } else {
-        log.push(`left as is: ${l.detail}; the two credential files differ, so the owner chooses which sign-in to keep`);
+  const steps = {
+    async harness() {
+      for (const result of await reconcileHarnessResources(record)) {
+        for (const file of result.written) log.push(`harness source reference ${join(result.workspace, file)}`);
+        if (result.containment?.changed) log.push(`harness containment reconciled ${result.containment.workUnit}`);
       }
-    }
-  }
+    },
 
-  if (want('retention')) {
-    const now = Date.now();
-    const files = sessionFiles(record.home);
-    const byPath = new Map(files.map((f) => [f.path, f]));
-    const bin = codexBinary(record.codexBinaryGlob);
-    await withThreadProvider({ binary: bin, home: record.home }, async request => {
-    const threads = await readThreads(record.home, { binary: bin, files, connect: (_options, operation) => operation(request) });
-    const toArchive = selectRetention(threads, byPath, now, record.retention.idleDays);
-    if (toArchive.length && !bin) log.push(`cannot archive: no Codex binary matches ${record.codexBinaryGlob}`);
-    for (const t of bin ? toArchive : []) {
-      try {
-        await request('thread/archive', { threadId: t.id });
-        log.push(`archived ${t.id} (${MB(t.bytes)})`);
-      } catch {
-        // A sub-agent thread is archived with its parent; its own archive then fails. Done if its log left.
-        const path = threads.find((x) => x.id === t.id)?.rollout_path;
-        log.push(existsSync(path) ? `archive failed ${t.id}` : `archived with parent ${t.id}`);
+    async placement() {
+      const rc = readText(record.shellRc);
+      writeIfChanged(record.shellRc, mergeManagedBlock(rc, shellRcLines(record)).text, log, `${record.shellRc} (managed block)`);
+      if (record.loginProfile) writeIfChanged(record.loginProfile, mergeManagedBlock(readText(record.loginProfile), shellRcLines(record)).text, log, `${record.loginProfile} (managed block)`);
+      for (const s of runningAppServerHomes().filter((s) => s.home !== record.home)) log.push(`WINDOWS restart the Codex app: its app-server (pid ${s.pid}) still runs on ${s.home}`);
+      const l = loginState(record);
+      if (!l.ok) {
+        const same = () => existsSync(l.homeAuth) && existsSync(l.winAuth) && readFileSync(l.homeAuth).equals(readFileSync(l.winAuth));
+        if (l.action === 'move-home-to-windows') {
+          const bytes = readFileSync(l.homeAuth);
+          if (lstatOrNull(l.winAuth)) rmSync(l.winAuth);            // a link: removes the link only
+          writeFileSync(l.winAuth, bytes); rmSync(l.homeAuth); symlinkSync(l.winAuth, l.homeAuth);
+          log.push(`moved the login to ${l.winAuth} and linked the home to it`);
+        } else if (l.action === 'link-home' || l.action === 'relink-home' || (l.action === 'link-home-if-identical' && same())) {
+          if (lstatOrNull(l.homeAuth)) rmSync(l.homeAuth);
+          symlinkSync(l.winAuth, l.homeAuth);
+          log.push(`linked ${l.homeAuth} -> ${l.winAuth}`);
+        } else {
+          log.push(`left as is: ${l.detail}; the two credential files differ, so the owner chooses which sign-in to keep`);
+        }
       }
-    }
-    const referenced = new Set(threads.map((t) => t.rollout_path));
-    for (const f of selectLegacy(sessionFiles(record.home), referenced, now)) {
-      const dest = join(record.retention.legacyDir, relative(join(record.home, 'sessions'), f.path));
-      mkdirSync(dirname(dest), { recursive: true });
-      renameSync(f.path, dest);
-      log.push(`moved legacy ${relative(record.home, f.path)}`);
-    }
-    });
-  }
+    },
 
-  if (want('scratch') && record.scratch) {
-    const headroom = observeHeadroom(record);
-    const commons = new Set();
-    for (const x of observeScratch(record, Date.now(), { idleMs: scratchLimit(record, headroom).ms }).filter((e) => e.expire)) {
-      try {
-        rmSync(x.path, { recursive: true, force: true });
-        log.push(`expired ${x.path} (${x.reason})`);
-      } catch (err) { log.push(`could not remove ${x.path}: ${err.code ?? err.message}`); }
-      for (const c of x.checkouts) if (c.common) commons.add(c.common);
-    }
-    // Removed worktrees leave registrations behind in their repository; git's own prune drops them.
-    for (const c of commons) {
-      if (!existsSync(c)) continue;
-      try { execFileSync('git', ['--git-dir', c, 'worktree', 'prune'], { stdio: 'ignore' }); log.push(`git worktree prune ${c}`); } catch { log.push(`git worktree prune failed for ${c}`); }
-    }
-    if (headroom?.low || headroom?.compact) log.push('HELD maintenance: ' + maintenanceReferral(record));
-  }
-
-  if (want('workspace')) {
-    for (const ws of record.workspaces ?? []) {
-      const p = join(ws.path, '.git', 'info', 'exclude');
-      writeIfChanged(p, mergeManagedBlock(readText(p), ws.excludes).text, log);
-      if (ws.gitMaintenance) {
-        const m = gitMaintenanceState(ws.path);
-        if (!m.timersEnabled) { execFileSync('git', ['-C', ws.path, 'maintenance', 'start'], { stdio: 'ignore', env: userManagerEnv() }); log.push(`git maintenance start ${ws.path}`); }
-        if (m.uncoveredPacks > (ws.maxUncoveredPacks ?? 10)) { execFileSync('git', ['-C', ws.path, 'multi-pack-index', 'write'], { stdio: 'ignore' }); log.push(`multi-pack-index write ${ws.path} (${m.uncoveredPacks} packs were uncovered)`); }
+    async retention() {
+      const now = Date.now();
+      const files = sessionFiles(record.home);
+      const byPath = new Map(files.map((f) => [f.path, f]));
+      const bin = codexBinary(record.codexBinaryGlob);
+      await withThreadProvider({ binary: bin, home: record.home }, async request => {
+      const threads = await readThreads(record.home, { binary: bin, files, connect: (_options, operation) => operation(request) });
+      const toArchive = selectRetention(threads, byPath, now, record.retention.idleDays);
+      if (toArchive.length && !bin) log.push(`cannot archive: no Codex binary matches ${record.codexBinaryGlob}`);
+      for (const t of bin ? toArchive : []) {
+        try {
+          await request('thread/archive', { threadId: t.id });
+          log.push(`archived ${t.id} (${MB(t.bytes)})`);
+        } catch {
+          // A sub-agent thread is archived with its parent; its own archive then fails. Done if its log left.
+          const path = threads.find((x) => x.id === t.id)?.rollout_path;
+          log.push(existsSync(path) ? `archive failed ${t.id}` : `archived with parent ${t.id}`);
+        }
       }
+      const referenced = new Set(threads.map((t) => t.rollout_path));
+      for (const f of selectLegacy(sessionFiles(record.home), referenced, now)) {
+        const dest = join(record.retention.legacyDir, relative(join(record.home, 'sessions'), f.path));
+        mkdirSync(dirname(dest), { recursive: true });
+        renameSync(f.path, dest);
+        log.push(`moved legacy ${relative(record.home, f.path)}`);
+      }
+      });
+    },
+
+    async scratch() {
+      if (!record.scratch) return;
+      const headroom = observeHeadroom(record);
+      const commons = new Set();
+      const observed = observeScratch(record, Date.now(), { idleMs: scratchLimit(record, headroom).ms });
+      let removed = 0;
+      for (const x of observed.filter((e) => e.expire)) {
+        try {
+          rmSync(x.path, { recursive: true, force: true });
+          removed++;
+          log.push(`expired ${x.path} (${x.reason})`);
+        } catch (err) { log.push(`could not remove ${x.path}: ${err.code ?? err.message}`); }
+        for (const c of x.checkouts) if (c.common) commons.add(c.common);
+      }
+      const kept = new Map();
+      for (const x of observed.filter((e) => !e.expire)) {
+        const why = x.reason.replace(/ in \/.*$/, '');      // a checkout's reason names its path; count the reason
+        kept.set(why, (kept.get(why) ?? 0) + 1);
+      }
+      notes.push(`scratch: ${removed} expired, ${kept.size ? [...kept.values()].reduce((a, b) => a + b, 0) : 0} kept of ${observed.length} entries${kept.size ? ` (${[...kept].map(([why, n]) => `${n} ${why}`).join('; ')})` : ''}`);
+      // Removed worktrees leave registrations behind in their repository; git's own prune drops them.
+      for (const c of commons) {
+        if (!existsSync(c)) continue;
+        try { execFileSync('git', ['--git-dir', c, 'worktree', 'prune'], { stdio: 'ignore' }); log.push(`git worktree prune ${c}`); } catch { log.push(`git worktree prune failed for ${c}`); }
+      }
+      if (headroom?.low || headroom?.compact) log.push('HELD maintenance: ' + maintenanceReferral(record));
+    },
+
+    async workspace() {
+      for (const ws of record.workspaces ?? []) {
+        const p = join(ws.path, '.git', 'info', 'exclude');
+        writeIfChanged(p, mergeManagedBlock(readText(p), ws.excludes).text, log);
+        if (ws.gitMaintenance) {
+          const m = gitMaintenanceState(ws.path);
+          if (!m.timersEnabled) { execFileSync('git', ['-C', ws.path, 'maintenance', 'start'], { stdio: 'ignore', env: userManagerEnv() }); log.push(`git maintenance start ${ws.path}`); }
+          if (m.uncoveredPacks > (ws.maxUncoveredPacks ?? 10)) { execFileSync('git', ['-C', ws.path, 'multi-pack-index', 'write'], { stdio: 'ignore' }); log.push(`multi-pack-index write ${ws.path} (${m.uncoveredPacks} packs were uncovered)`); }
+        }
+      }
+    },
+
+    async config() {
+      const p = join(record.home, 'config.toml');
+      const text = readText(p);
+      const lines = pluginLines(record, text);
+      const merged = lines.length ? mergeManagedBlock(text, lines).text : text;
+      writeIfChanged(p, merged, log, `${p} (managed block)`);
+      for (const { plugin, server } of record.disabledPluginMcpServers ?? []) {
+        if (pluginServerState(merged, plugin, server) === 'enabled') log.push(`left as is: ${pluginHeader(plugin, server)} is set outside the managed block with enabled not false`);
+      }
+    },
+
+    async timer() {
+      const directory = ports.timerDirectory?.() ?? timerDir();
+      const control = ports.systemctlUser ?? systemctlUser;
+      for (const c of installPlan(record, { script, parameters })) writeInstalled(c.to, readText(c.from), log);
+      const inst = installedPaths(record);
+      const units = renderTimerUnits(record, inst.script, inst.parameters);
+      const a = writeIfChanged(join(directory, 'codex-home-retention.service'), units.service, log);
+      const b = writeIfChanged(join(directory, 'codex-home-retention.timer'), units.timer, log);
+      if (a || b) control('daemon-reload');
+      control('enable', '--now', 'codex-home-retention.timer');
+    },
+  };
+
+  for (const name of APPLY_SCOPES) {
+    if (!want(name)) continue;
+    try { await steps[name](); }
+    catch (error) {
+      failures.push({ scope: name, error });
+      log.push(`FAILED ${name}: ${error.message}`);
     }
   }
+  return { log, notes, failures };
+}
 
-  if (want('config')) {
-    const p = join(record.home, 'config.toml');
-    const text = readText(p);
-    const lines = pluginLines(record, text);
-    const merged = lines.length ? mergeManagedBlock(text, lines).text : text;
-    writeIfChanged(p, merged, log, `${p} (managed block)`);
-    for (const { plugin, server } of record.disabledPluginMcpServers ?? []) {
-      if (pluginServerState(merged, plugin, server) === 'enabled') log.push(`left as is: ${pluginHeader(plugin, server)} is set outside the managed block with enabled not false`);
-    }
-  }
-
-  if (want('timer')) {
-    const directory = ports.timerDirectory?.() ?? timerDir();
-    const control = ports.systemctlUser ?? systemctlUser;
-    for (const c of installPlan(record, { script, parameters })) writeInstalled(c.to, readText(c.from), log);
-    const inst = installedPaths(record);
-    const units = renderTimerUnits(record, inst.script, inst.parameters);
-    const a = writeIfChanged(join(directory, 'codex-home-retention.service'), units.service, log);
-    const b = writeIfChanged(join(directory, 'codex-home-retention.timer'), units.timer, log);
-    if (a || b) control('daemon-reload');
-    control('enable', '--now', 'codex-home-retention.timer');
-  }
+/** `applyScopes` for callers that want the log or an exception: the log when every scope succeeded, else ApplyFailed. */
+export async function apply(record, scope, context, ports = {}) {
+  const { log, failures } = await applyScopes(record, scope, context, ports);
+  if (failures.length) throw new ApplyFailed(log, failures);
   return log;
 }

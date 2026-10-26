@@ -18,12 +18,14 @@ Keeps a Codex home sound from one parameter record:
 - disabled plugin MCP servers stay off
 - agent scratch roots lose entries unchanged past an idle limit, never ones open, mounted, kept or holding unpushed work
 
-A user timer runs retention daily. Node built-ins only.
+A user timer runs retention hourly. Each apply scope runs on its own: one scope's failure is reported and the others still run. Node built-ins only.
 
 ```sh
 node scripts/codex-home.mjs plan  --parameters=<codex-home.json>    # read-only; exit 0 converged, 2 drift
-node scripts/codex-home.mjs apply --parameters=<codex-home.json>    # idempotent; --scope=placement|retention|scratch|workspace|config|timer[,...]
+node scripts/codex-home.mjs apply --parameters=<codex-home.json>    # idempotent; --scope=placement|retention|scratch|workspace|config|timer|harness[,...]
 ```
+
+Exit status: 0 converged, 2 drift remains, 1 when any apply scope failed (the other scopes still ran), 64 usage.
 
 `plan` is the health check. It reads sizes, links and small files only. It never walks a workspace or greps logs, because on a loaded WSL host that is the load being diagnosed.
 
