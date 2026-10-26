@@ -51,12 +51,29 @@ export function shellPathDirectories(record) {
   return [...new Set(dirs)];
 }
 
+/**
+ * CH-31: variables the record exports in login shells, each `NAME: value`. A value is plain text or `${NAME}`
+ * references to variables already set (the credentials directory, say), so a tool's configuration can be named
+ * as a file credential custody renders rather than a file in a home directory. Names the block already owns
+ * (CODEX_HOME, PATH) and anything a shell would read as syntax are refused.
+ */
+export function shellEnvironmentExports(record) {
+  const entries = Object.entries(record.shellEnvironment ?? {});
+  const plain = /^(?:[A-Za-z0-9_@%+=,.\/:-]|\$\{[A-Z][A-Z0-9_]*\})+$/u;
+  if (!entries.every(([name, value]) => /^[A-Z][A-Z0-9_]*$/u.test(name) && !['CODEX_HOME', 'PATH'].includes(name) && typeof value === 'string' && plain.test(value))) {
+    throw new Error('shellEnvironment must map UPPER_CASE names (not CODEX_HOME or PATH) to values made of letters, digits, _@%+=,./:- and ${NAME} references');
+  }
+  return entries.map(([name, value]) => `export ${name}="${value}"`);
+}
+
 export function shellRcLines(record) {
   const dirs = shellPathDirectories(record);
+  const exported = shellEnvironmentExports(record);
   return [
     '# The Codex home lives on the Linux filesystem only; a home on /mnt/* (the Windows bridge) made every',
     '# Codex start take minutes (observed-2026-10-14 in the record). Kept last so nothing above overrides it.',
     `export CODEX_HOME="${record.home}"`,
+    ...(exported.length === 0 ? [] : ['# Variables of the record\'s shellEnvironment.', ...exported]),
     ...(dirs.length === 0 ? [] : [
       '# Directories of the record\'s shellPath, ahead of the system ones (each added once, however many shells nest).',
       ...dirs.toReversed().map((d) => `case ":$PATH:" in *":${d}:"*) ;; *) PATH="${d}:$PATH" ;; esac`),

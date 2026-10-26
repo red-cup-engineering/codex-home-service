@@ -13,6 +13,7 @@ Keeps a Codex home sound from one parameter record:
 - the Windows-side app reads the one login through a link
 - the folder Codex's thread search reads holds only live threads (idle ones archived through Codex, unlisted legacy logs moved aside)
 - the login shell's `PATH` carries the record's `shellPath` directories ahead of the system ones (`shellPath`, optional; for example a shim directory that makes agent `gh` calls use the GitHub App's installation tokens), declared in the same managed blocks as the Codex home
+- the login shell exports the record's `shellEnvironment` (optional; for example `NPM_CONFIG_USERCONFIG` naming the npm configuration credential custody renders under the credentials directory, so no credential is kept in a home directory)
 - generated workspace paths stay out of git's untracked set
 - disabled plugin MCP servers stay off
 - agent scratch roots lose entries unchanged past an idle limit, never ones open, mounted, kept or holding unpushed work

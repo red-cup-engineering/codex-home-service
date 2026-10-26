@@ -37,6 +37,7 @@ test('managed block is replaced in place and owner lines survive', () => {
 test('shell block exports the record home (CH-1)', () => {
   assert.ok(shellRcLines(record).includes('export CODEX_HOME="/h/.codex"'));
   assert.ok(!shellRcLines(record).some((line) => line.includes('PATH')), 'no shellPath, no PATH line');
+  assert.deepEqual(shellRcLines(record).filter((line) => line.startsWith('export ')), ['export CODEX_HOME="/h/.codex"'], 'no shellEnvironment, no other export');
 });
 
 test('shellPath puts the record\'s directories ahead of the system ones, once, in order (CH-30)', () => {
@@ -47,6 +48,16 @@ test('shellPath puts the record\'s directories ahead of the system ones, once, i
   assert.deepEqual(out, ['/a/shims:/b/bin:/usr/bin:/bin', '/a/shims:/b/bin:/usr/bin:/bin'], 'sourced twice, still one entry each, first listed first');
   for (const bad of [['relative'], ['/a b'], ['/a;rm'], ['/a"'], ['/a$HOME'], ['/'], ['/a//b'], [1], 'x']) {
     assert.throws(() => shellRcLines({ ...record, shellPath: bad }), /shellPath must be/u, JSON.stringify(bad));
+  }
+});
+
+test('shellEnvironment exports the record\'s variables, expanding references to variables already set (CH-31)', () => {
+  const lines = shellRcLines({ ...record, shellEnvironment: { NPM_CONFIG_USERCONFIG: '${CREDENTIALS_DIRECTORY}/npm/npmrc', TOOL_MODE: 'quiet' } });
+  assert.ok(lines.includes('export NPM_CONFIG_USERCONFIG="${CREDENTIALS_DIRECTORY}/npm/npmrc"') && lines.includes('export TOOL_MODE="quiet"'));
+  const out = execFileSync('sh', ['-c', ['CREDENTIALS_DIRECTORY=/run/c', ...lines, 'echo "$NPM_CONFIG_USERCONFIG $TOOL_MODE"'].join('\n')], { encoding: 'utf8' }).trim();
+  assert.equal(out, '/run/c/npm/npmrc quiet');
+  for (const bad of [{ lower: 'x' }, { CODEX_HOME: '/x' }, { PATH: '/x' }, { A: '' }, { A: '$(id)' }, { A: '`id`' }, { A: 'a b' }, { A: '"; id; "' }, { A: '${lower}' }, { A: '$HOME' }, { A: 1 }]) {
+    assert.throws(() => shellRcLines({ ...record, shellEnvironment: bad }), /shellEnvironment must map/u, JSON.stringify(bad));
   }
 });
 
