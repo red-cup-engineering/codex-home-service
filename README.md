@@ -25,6 +25,10 @@ node scripts/codex-home.mjs plan  --parameters=<codex-home.json>    # read-only;
 node scripts/codex-home.mjs apply --parameters=<codex-home.json>    # idempotent; --scope=placement|retention|scratch|workspace|config|timer|harness[,...]
 ```
 
+```sh
+node scripts/codex-home.mjs retire --parameters=<codex-home.json> --session=<id> [--after-pid=<pid>]   # an ended session's scratch, now; exit 0
+```
+
 Exit status: 0 converged, 2 drift remains, 1 when any apply scope failed (the other scopes still ran), 64 usage.
 
 `plan` is the health check. It reads sizes, links and small files only. It never walks a workspace or greps logs, because on a loaded WSL host that is the load being diagnosed.
