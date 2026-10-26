@@ -681,6 +681,55 @@ function writeIfChanged(path, text, log, label) {
   return true;
 }
 
+/** Remove the entries `observeScratch` decided to expire, then let git drop the worktree registrations they leave. Returns the count removed. */
+function removeExpired(observed, log) {
+  const commons = new Set();
+  let removed = 0;
+  for (const x of observed.filter((e) => e.expire)) {
+    try {
+      rmSync(x.path, { recursive: true, force: true });
+      removed++;
+      log.push(`expired ${x.path} (${x.reason})`);
+    } catch (err) { log.push(`could not remove ${x.path}: ${err.code ?? err.message}`); }
+    for (const c of x.checkouts) if (c.common) commons.add(c.common);
+  }
+  // Removed worktrees leave registrations behind in their repository; git's own prune drops them.
+  for (const c of commons) {
+    if (!existsSync(c)) continue;
+    try { execFileSync('git', ['--git-dir', c, 'worktree', 'prune'], { stdio: 'ignore' }); log.push(`git worktree prune ${c}`); } catch { log.push(`git worktree prune failed for ${c}`); }
+  }
+  return removed;
+}
+
+const processGone = (pid, proc) => !existsSync(join(proc, String(pid)));
+
+/**
+ * CH-35: an event, not a clock, retires one session's scratch: the entry named `session` in each root that names
+ * `liveSessionFlags`, with no idle wait, through the same guards as the scratch scope (kept, mounted, open, running
+ * under that id, uncommitted or unpushed git work). With `afterPid` it first waits, up to `waitMs`, for that process
+ * (the ending session itself) to exit, because a session's own process still holds its folder when SessionEnd fires.
+ * Returns { removed, held: [{ path, reason }], log }.
+ */
+export async function retireSession(record, { session, afterPid = null, waitMs = 600_000, processRoot = '/proc', pollMs = 200 }) {
+  validateScratch(record);
+  if (typeof session !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(session)) throw new TypeError('a session id of letters, digits and ._- is required');
+  const roots = (record.scratch?.roots ?? []).filter((r) => r.liveSessionFlags && !r.retirementOwner);
+  const log = [], held = [];
+  const deadline = performance.now() + waitMs;
+  while (afterPid && !processGone(afterPid, processRoot)) {
+    if (performance.now() >= deadline) return { removed: 0, held: [{ path: session, reason: `session process ${afterPid} still running` }], log };
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  let removed = 0;
+  for (const root of roots) {
+    if (!existsSync(join(root.path, session))) continue;
+    const observed = observeScratch({ ...record, scratch: { ...record.scratch, roots: [root] } }, Date.now(), { idleMs: 0, readRootEntries: () => [session], processRoot });
+    removed += removeExpired(observed, log);
+    for (const x of observed.filter((e) => !e.expire)) held.push({ path: x.path, reason: x.reason });
+  }
+  return { removed, held, log };
+}
+
 /** Scopes in the order `apply` runs them; each is independent of the others (CH-32). */
 export const APPLY_SCOPES = Object.freeze(['harness', 'placement', 'retention', 'scratch', 'workspace', 'config', 'timer']);
 
@@ -773,28 +822,14 @@ export async function applyScopes(record, scope, { script, parameters }, ports =
     async scratch() {
       if (!record.scratch) return;
       const headroom = observeHeadroom(record);
-      const commons = new Set();
       const observed = observeScratch(record, Date.now(), { idleMs: scratchLimit(record, headroom).ms });
-      let removed = 0;
-      for (const x of observed.filter((e) => e.expire)) {
-        try {
-          rmSync(x.path, { recursive: true, force: true });
-          removed++;
-          log.push(`expired ${x.path} (${x.reason})`);
-        } catch (err) { log.push(`could not remove ${x.path}: ${err.code ?? err.message}`); }
-        for (const c of x.checkouts) if (c.common) commons.add(c.common);
-      }
+      const removed = removeExpired(observed, log);
       const kept = new Map();
       for (const x of observed.filter((e) => !e.expire)) {
         const why = x.reason.replace(/ in \/.*$/, '');      // a checkout's reason names its path; count the reason
         kept.set(why, (kept.get(why) ?? 0) + 1);
       }
-      notes.push(`scratch: ${removed} expired, ${kept.size ? [...kept.values()].reduce((a, b) => a + b, 0) : 0} kept of ${observed.length} entries${kept.size ? ` (${[...kept].map(([why, n]) => `${n} ${why}`).join('; ')})` : ''}`);
-      // Removed worktrees leave registrations behind in their repository; git's own prune drops them.
-      for (const c of commons) {
-        if (!existsSync(c)) continue;
-        try { execFileSync('git', ['--git-dir', c, 'worktree', 'prune'], { stdio: 'ignore' }); log.push(`git worktree prune ${c}`); } catch { log.push(`git worktree prune failed for ${c}`); }
-      }
+      notes.push(`scratch: ${removed} expired, ${[...kept.values()].reduce((a, b) => a + b, 0)} kept of ${observed.length} entries${kept.size ? ` (${[...kept].map(([why, n]) => `${n} ${why}`).join('; ')})` : ''}`);
       if (headroom?.low || headroom?.compact) log.push('HELD maintenance: ' + maintenanceReferral(record));
     },
 
