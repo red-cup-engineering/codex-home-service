@@ -79,6 +79,7 @@ Leader, 2026-10-23: "these giant disc-reads are KILLING our system" and "Where i
 
 - CH-29. When harnessResources is selected, the existing retention schedule shall reconcile those exact provider registrations at its unchanged cadence, preserving unrelated hooks and provider trust.
 - CH-30. When the record lists `shellPath`, the service shall declare those absolute directories ahead of the system ones in the same managed blocks that declare the Codex home (each added once however many shells nest), refuse a directory a shell would read as syntax, and report drift in `plan` like the rest of the block, so a host's login-shell `PATH` is changed by its record and never by a hand-edited startup file.
+- CH-31. When the record lists `shellEnvironment`, the service shall export those variables in the same managed blocks, each value plain text or `${NAME}` references to variables already set, and refuse a name the block owns (`CODEX_HOME`, `PATH`) or a value a shell would read as syntax, so a tool's configuration can be named as a file credential custody renders under the credentials directory instead of a file in a home directory.
 
 Leader, 2026-10-23: "We shuoldn't have any sqlite or sql anywhere lol". CH-27 replaces direct private-storage access with the provider-owned thread/list and thread/archive protocol. The house service imports no SQL driver, issues no SQL and owns no provider database. Vendor internals remain vendor-owned; deleting or rewriting them is not a migration.
 
