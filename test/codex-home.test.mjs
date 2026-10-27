@@ -8,7 +8,7 @@ import {
   BEGIN, END, mergeManagedBlock, withoutManagedBlock, shellRcLines, pluginHeader, pluginServerState, pluginLines,
   selectRetention, selectLegacy, renderTimerUnits, installedPaths, uncoveredPacks, classifyLogin,
   loginShellCodexHome, runningAppServerHomes,
-  judgeHeadroom, scratchLimit, observeScratch, refuseAutomaticCollection, apply,
+  observeScratch, apply,
 } from '../src/codex-home.mjs';
 
 const record = {
@@ -198,17 +198,6 @@ test('a scratch entry goes when its newest mtime, itself or immediate child, is 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('headroom is low on either side; the logical gap retains only a maintenance referral (CH-18, CH-19)', () => {
-  const h = { floorBytes: 100, compactAboveBytes: 50 };
-  assert.deepEqual(judgeHeadroom({ vmFree: 500, vmUsed: 400, hostFree: 10, imageBytes: 540 }, h), { low: true, slack: 140, compact: true });
-  assert.deepEqual(judgeHeadroom({ vmFree: 500, vmUsed: 400, hostFree: 200, imageBytes: 420 }, h), { low: false, slack: 20, compact: false });
-  assert.equal(judgeHeadroom({ vmFree: 90, vmUsed: 400, hostFree: null, imageBytes: null }, h).low, null);
-  const r = { scratch: { idleDays: 2 }, headroom: { idleHours: 6 } };
-  assert.deepEqual(scratchLimit(r, { low: false }), { ms: 2 * DAY, text: '2 d' });
-  assert.deepEqual(scratchLimit(r, { low: true }), { ms: 6 * 3_600_000, text: '6 h' });
-  assert.deepEqual(scratchLimit(r, null), { ms: 2 * DAY, text: '2 d' });
-});
-
 test('a root\'s match limits which of its entries are scratch (CH-16)', () => {
   const root = mkdtempSync(join(tmpdir(), 'scratch-root-'));
   try {
@@ -218,15 +207,6 @@ test('a root\'s match limits which of its entries are scratch (CH-16)', () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('legacy automatic collection refuses before even retention effects', async () => {
-  for (const field of ['guix', 'compactCommand']) for (const scope of ['retention,scratch', 'retention', 'scratch', 'timer', 'all']) {
-    let controls = 0;
-    await assert.rejects(() => apply({ headroom: { [field]: '/must-never-run' } }, scope, {}, { systemctlUser: () => { controls++; } }), /unqualified automatic maintenance selector refused before effects/);
-    assert.equal(controls, 0);
-  }
-  assert.throws(() => scratchLimit({ scratch: { idleDays: 2 }, headroom: { idleHours: 6 } }, { low: null }), /retirement held/);
-  assert.throws(() => scratchLimit({ scratch: { idleDays: 2 }, headroom: { idleHours: Infinity } }, { low: true }), /finite bounded/);
-});
 test('timer-only installation atomically copies exact selected files and keeps the existing hourly timer', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codex-install-'));
   try {
@@ -237,7 +217,7 @@ test('timer-only installation atomically copies exact selected files and keeps t
     writeFileSync(join(source, 'src/codex-home.mjs'), '// exact-source\n');
     writeFileSync(join(source, 'src/thread-provider.mjs'), '// exact-native-provider\n');
     writeFileSync(script, '// exact-cli\n');
-    const selected = { installDir: installed, node: '/native/node', retention: { onCalendar: 'hourly', onBootDelay: '15min' }, headroom: { maintenanceReferral: 'existing WSL owner', legacyMaintenance: { guix: '/inactive-provenance' } } };
+    const selected = { installDir: installed, node: '/native/node', retention: { onCalendar: 'hourly', onBootDelay: '15min' } };
     writeFileSync(parameters, JSON.stringify(selected));
     const calls = [];
     const ports = { timerDirectory: () => units, systemctlUser: (...args) => calls.push(args) };
