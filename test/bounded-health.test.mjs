@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readThreads, scratchActivity, reconcileHarnessResources, observe, renderTimerUnits } from '../src/codex-home.mjs';
+import { readThreads, reconcileHarnessResources, observe, renderTimerUnits } from '../src/codex-home.mjs';
 import { fileURLToPath } from 'node:url';
 
 function fixture(t) { const p=fs.mkdtempSync(join(tmpdir(),'health-read-')); t.after(()=>{const scratch=join(p,'scratch');if(fs.existsSync(scratch))fs.chmodSync(scratch,0o700);fs.rmSync(p,{recursive:true,force:true})}); return p; }
@@ -12,10 +12,6 @@ test('thread metadata uses the native provider and resolves omitted paths from t
  const rows=await readThreads('/native/home',{binary:'/native/codex',files:[{path:'/native/home/sessions/rollout-id-1.jsonl'}],connect:async(options,operation)=>{assert.equal(options.binary,'/native/codex');return operation(async(method,params)=>{calls.push({method,params});return {data:params.archived?[]:[{id:'id-1',path:null}],nextCursor:null};});}});
  assert.deepEqual(rows,[{id:'id-1',rollout_path:'/native/home/sessions/rollout-id-1.jsonl',archived:0}]);
  assert.equal(calls.length,2);assert.ok(calls.every(c=>c.method==='thread/list'&&c.params.useStateDbOnly===true));
-});
-
-test('activity deadline refuses before touching an unknown entry',()=>{
- assert.equal(scratchActivity('/missing/entry',0,{budget:{deadline:0,remaining:0}}).complete,false);
 });
 
 test('health observes declared scratch policy without opening its unreadable root', async t => {

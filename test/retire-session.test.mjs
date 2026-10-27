@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { retireSession } from '../src/codex-home.mjs';
@@ -13,8 +13,7 @@ const fixture = () => { const r = fs.mkdtempSync(join(tmpdir(), 'retire-session-
 test.after(() => { for (const r of roots) fs.rmSync(r, { recursive: true, force: true }); });
 const script = fileURLToPath(new URL('../scripts/codex-home.mjs', import.meta.url));
 const entry = (dir, name) => { const p = join(dir, name); fs.mkdirSync(join(p, 'scratchpad'), { recursive: true }); fs.writeFileSync(join(p, 'scratchpad', 'f'), name); return p; };
-const recordFor = (scratch) => ({ home: fixture(), scratch: { idleDays: 2, roots: [{ path: scratch, liveSessionFlags: ['--session-id', '--resume'] }] } });
-const git = (cwd, ...a) => execFileSync('git', ['-c', 'user.email=t@example.invalid', '-c', 'user.name=t', ...a], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+const recordFor = (scratch) => ({ home: fixture(), scratch: { idleDays: 2, roots: [{ path: scratch }] } });
 const SID = 'aaaaaaaa-1111-4111-8111-111111111111';
 const hold = ['-e', 'setTimeout(() => {}, 120000)', '--'];
 
@@ -32,20 +31,15 @@ test('the session id is a name, never a path (CH-35)', async () => {
   assert.equal(fs.existsSync(mine), true);
 });
 
-test('a session whose process still runs is kept; one with unpushed git work is kept (CH-35)', async () => {
+test('a session folder that a running process has as its cwd is kept (CH-35)', async () => {
   const scratch = fixture(), mine = entry(scratch, SID);
-  const child = spawn(process.execPath, [...hold, `--session-id=${SID}`], { stdio: 'ignore' });
+  const child = spawn(process.execPath, [...hold], { cwd: mine, stdio: 'ignore' });
   try {
     await once(child, 'spawn');
     const held = await retireSession(recordFor(scratch), { session: SID });
     assert.equal(held.removed, 0);
-    assert.equal(held.held[0].reason, 'belongs to a running session');
+    assert.equal(held.held[0].reason, 'open in a running process');
   } finally { child.kill('SIGKILL'); await once(child, 'exit'); }
-  git(mine, 'init', '--initial-branch=main'); fs.writeFileSync(join(mine, 'w'), 'x'); git(mine, 'add', 'w'); git(mine, 'commit', '-m', 'w');
-  const unpushed = await retireSession(recordFor(scratch), { session: SID });
-  assert.equal(unpushed.removed, 0);
-  assert.match(unpushed.held[0].reason, /uncommitted changes|commits on no remote/);
-  assert.equal(fs.existsSync(mine), true);
 });
 
 test('with afterPid it waits for the ending session process to exit, then retires (CH-35)', async () => {

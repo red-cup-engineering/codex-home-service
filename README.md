@@ -16,7 +16,7 @@ Keeps a Codex home sound from one parameter record:
 - the login shell exports the record's `shellEnvironment` (optional; for example `NPM_CONFIG_USERCONFIG` naming the npm configuration credential custody renders under the credentials directory, so no credential is kept in a home directory)
 - generated workspace paths stay out of git's untracked set
 - disabled plugin MCP servers stay off
-- agent scratch roots lose entries unchanged past an idle limit, never ones open, mounted, kept or holding unpushed work
+- agent scratch roots lose entries unchanged past an idle limit (by mtime of the entry and its immediate children), except ones kept by the record, mounted, or in use as a process's cwd or open file; commit and push, or it is gone
 
 A user timer runs retention hourly. Each apply scope runs on its own: one scope's failure is reported and the others still run. Node built-ins only.
 
