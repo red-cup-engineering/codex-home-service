@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, utimesSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -168,7 +170,7 @@ test('the timer also expires scratch when the record declares scratch roots (CH-
   assert.match(u.service, /apply --scope=retention,scratch --parameters=\/i\/r\.json/);
 });
 
-test('a scratch entry goes when its newest mtime, itself or immediate child, is older than idleDays, unless kept or in use (CH-16)', () => {
+test('age retires only empty directories; nested and unpublished source survives (CH-16)', () => {
   const root = mkdtempSync(join(tmpdir(), 'scratch-age-'));
   const old = new Date(Date.now() - 30 * DAY), fresh = new Date();
   const mk = (name, ...children) => {
@@ -178,7 +180,7 @@ test('a scratch entry goes when its newest mtime, itself or immediate child, is 
     utimesSync(d, old, old); return d;
   };
   try {
-    mk('idle', 'f');
+    mk('idle', 'f'); mk('empty');
     mk('touched-child', 'f'); utimesSync(join(root, 'touched-child', 'f'), fresh, fresh);
     mk('kept', 'f');
     const deep = mk('deep-change'); mkdirSync(join(deep, 'a', 'b'), { recursive: true });
@@ -190,10 +192,11 @@ test('a scratch entry goes when its newest mtime, itself or immediate child, is 
     try {
       const es = Object.fromEntries(observeScratch({ scratch: { idleDays: 2, roots: [{ path: root, keep: ['kept'] }] } }, Date.now(), { readRootEntries: () => readdirSync(root).sort() }).map((e) => [e.name, e]));
       assert.deepEqual(Object.fromEntries(Object.entries(es).map(([n, e]) => [n, e.expire])),
-        { cwd: false, 'deep-change': true, idle: true, kept: false, 'touched-child': false, 'unpushed-git': true });
+        { cwd: false, 'deep-change': false, empty: true, idle: false, kept: false, 'touched-child': false, 'unpushed-git': false });
       assert.equal(es.kept.reason, 'kept by the record');
       assert.equal(es.cwd.reason, 'open in a running process');
-      assert.equal(es['touched-child'].reason, 'active');
+      assert.match(es['touched-child'].reason, /retained for original-owner/);
+      assert.match(es['unpushed-git'].reason, /retained for original-owner/);
     } finally { sleeper.kill('SIGKILL'); }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -231,4 +234,18 @@ test('timer-only installation atomically copies exact selected files and keeps t
     assert.deepEqual(second, []);
     assert.deepEqual(calls, [['enable', '--now', 'codex-home-retention.timer']]);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('native generic cleanup preserves useful files/source and an arriving child', async () => {
+  const root=mkdtempSync(join(tmpdir(),'scratch-safe-native-'));
+  try {
+    mkdirSync(join(root,'empty'));mkdirSync(join(root,'racing'));mkdirSync(join(root,'useful'));writeFileSync(join(root,'useful','unpublished.mjs'),'export const valuable=1;');writeFileSync(join(root,'unpublished.txt'),'useful');
+    for(const name of readdirSync(root))utimesSync(join(root,name),new Date(0),new Date(0));
+    const original=nativeFs.rmdirSync;
+    nativeFs.rmdirSync=path=>{if(path===join(root,'racing'))writeFileSync(join(path,'arriving.mjs'),'preserve');return original(path);};syncBuiltinESMExports();
+    try {await apply({...record,scratch:{idleDays:2,roots:[{path:root}]}},'scratch',{script:'/not-used',parameters:'/not-used'});}
+    finally{nativeFs.rmdirSync=original;syncBuiltinESMExports();}
+    assert.deepEqual(readdirSync(root).sort(),['racing','unpublished.txt','useful']);
+    assert.equal(readFileSync(join(root,'racing','arriving.mjs'),'utf8'),'preserve');assert.equal(readFileSync(join(root,'useful','unpublished.mjs'),'utf8'),'export const valuable=1;');
+  }finally{rmSync(root,{recursive:true,force:true});}
 });

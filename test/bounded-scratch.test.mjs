@@ -17,7 +17,7 @@ test('delegated retirement holds live and unknown children before listing and sc
   fs.utimesSync(path.join(child,'product'),old,old);fs.utimesSync(child,old,old);
  }
  const record={home:path.join(root,'home'),scratch:{idleDays:2,roots:[{path:delegated}]}};
- const incumbent=observeScratch(record);assert.equal(incumbent.length,2);assert.ok(incumbent.every(x=>x.expire));
+ const incumbent=observeScratch(record);assert.equal(incumbent.length,2);assert.ok(incumbent.every(x=>!x.expire));assert.ok(incumbent.every(x=>x.reason.includes('original-owner')));
  const owner='https://github.com/example/deployment-owner';record.scratch.roots[0].retirementOwner=owner;
  const held=observeScratch(record,Date.now(),{readRootEntries(){throw Error('delegated root must not be listed');}});
  assert.equal(held.length,1);assert.equal(held[0].expire,false);assert.equal(held[0].retirementOwner,owner);

@@ -3,7 +3,7 @@
 // Node built-ins only.
 import {
   readFileSync, writeFileSync, existsSync, lstatSync, statSync, readdirSync, mkdirSync, renameSync,
-  rmSync, readlinkSync, symlinkSync,
+  rmSync, rmdirSync, opendirSync, realpathSync, readlinkSync, symlinkSync,
   openSync, closeSync, fsyncSync,
 } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
@@ -354,6 +354,17 @@ export function scratchRetirementOwners(record) {
   });
 }
 
+/** Receive emptiness without a recursive source/checkout census. */
+function emptyScratchDirectory(path) {
+  try {
+    const s = lstatSync(path);
+    if (!s.isDirectory() || s.uid !== process.getuid() || realpathSync(path) !== path) return null;
+    const dir = opendirSync(path);
+    try { if (dir.readSync() !== null) return null; } finally { dir.closeSync(); }
+    return { dev: s.dev, ino: s.ino };
+  } catch { return null; }
+}
+
 /** Every top-level entry under each scratch root, with its fate (CH-16): older than `idleMs`, and not kept, mounted or some process's cwd or open file. */
 export function observeScratch(record, now = Date.now(), { idleMs = record.scratch?.idleDays * DAY_MS, readRootEntries = readdirSync } = {}) {
   const s = record.scratch;
@@ -370,6 +381,9 @@ export function observeScratch(record, now = Date.now(), { idleMs = record.scrat
       if ((root.keep ?? []).includes(name)) return { ...e, expire: false, reason: 'kept by the record' };
       if (under(mounts, path)) return { ...e, expire: false, reason: 'a filesystem is mounted inside' };
       if (under(open, path)) return { ...e, expire: false, reason: 'open in a running process' };
+      const emptyIdentity = emptyScratchDirectory(path);
+      if (!emptyIdentity) return { ...e, expire: false, reason: 'contents or custody retained for original-owner recovery/reuse/publication' };
+      e.emptyIdentity = emptyIdentity;
       let newestMs;
       try { newestMs = scratchNewestMs(path); } catch { return { ...e, expire: false, reason: 'gone' }; }
       return newestMs > cutoffMs ? { ...e, expire: false, reason: 'active' } : { ...e, expire: true, reason: `unchanged since ${new Date(newestMs).toISOString().slice(0, 10)}` };
@@ -451,7 +465,7 @@ export async function observe(record, { script, parameters }) {
     for (const root of record.scratch.roots) {
       items.push({ id: `CH-16 scratch policy ${root.path}`, status: 'current', detail: root.retirementOwner
         ? `retirement delegated to ${root.retirementOwner}; no listing`
-        : `not inspected by health plan; scoped scratch apply removes entries idle > ${limit.text}` });
+        : `not inspected by health plan; age > ${limit.text} selects empty-directory candidates only; contents remain for original-owner recovery` });
     }
   }
 
@@ -523,10 +537,14 @@ function removeExpired(observed, log) {
   let removed = 0;
   for (const x of observed.filter((e) => e.expire)) {
     try {
-      rmSync(x.path, { recursive: true, force: true });
+      const current = emptyScratchDirectory(x.path);
+      if (!current || !x.emptyIdentity || current.dev !== x.emptyIdentity.dev || current.ino !== x.emptyIdentity.ino) {
+        x.expire = false; x.reason = 'changed or nonempty directory retained'; continue;
+      }
+      rmdirSync(x.path); // Native ENOTEMPTY protects a child created after receiving.
       removed++;
       log.push(`expired ${x.path} (${x.reason})`);
-    } catch (err) { log.push(`could not remove ${x.path}: ${err.code ?? err.message}`); }
+    } catch (err) { x.expire = false; x.reason = 'native directory retirement refused; contents retained'; log.push(`could not remove ${x.path}: ${err.code ?? err.message}`); }
   }
   return removed;
 }
