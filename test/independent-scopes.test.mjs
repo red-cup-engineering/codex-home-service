@@ -38,11 +38,11 @@ test('a failing scope is reported and the scopes after it still run (CH-32)', as
 });
 
 test('scopes run in the listed order whichever way the caller names them, and each failure is its own', async () => {
-  const root = fixture(), record = { ...failingRetention(root), headroom: { vmVolume: join(root, 'no-vm'), hostVolume: join(root, 'no-host'), floorBytes: 1, idleHours: 1 } };
+  const root = fixture(), base = failingRetention(root), record = { ...base, scratch: { ...base.scratch, idleDays: 0 } };
   const entry = idleEntry(record.scratch.roots[0].path, 'idle-task');
   const { failures, log } = await applyScopes(record, 'scratch,retention', { script, parameters: '/unused' });
   assert.deepEqual(failures.map((f) => f.scope), ['retention', 'scratch']);
-  assert.match(failures[1].error.message, /unknown pressure: scratch retirement held/);
+  assert.match(failures[1].error.message, /finite bounded scratch cutoff required/);
   assert.equal(fs.existsSync(entry), true);                                   // held, not removed
   assert.deepEqual(log.filter((l) => l.startsWith('FAILED')).map((l) => l.split(':')[0]), ['FAILED retention', 'FAILED scratch']);
 });
@@ -55,7 +55,7 @@ test('an unrelated later scope is installed although scratch failed (CH-32)', as
   fs.writeFileSync(join(source, 'src/codex-home.mjs'), '// src\n');
   fs.writeFileSync(join(source, 'src/thread-provider.mjs'), '// provider\n');
   fs.writeFileSync(entry, '// cli\n');
-  const record = { ...failingRetention(root), headroom: { vmVolume: join(root, 'no-vm'), hostVolume: join(root, 'no-host'), floorBytes: 1, idleHours: 1 } };
+  const base = failingRetention(root), record = { ...base, scratch: { ...base.scratch, idleDays: 0 } };
   fs.writeFileSync(parameters, JSON.stringify(record));
   const calls = [];
   const ports = { timerDirectory: () => units, systemctlUser: (...args) => calls.push(args) };

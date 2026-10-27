@@ -3,7 +3,7 @@
 // Node built-ins only.
 import {
   readFileSync, writeFileSync, existsSync, lstatSync, statSync, readdirSync, mkdirSync, renameSync,
-  rmSync, readlinkSync, symlinkSync, statfsSync,
+  rmSync, readlinkSync, symlinkSync,
   openSync, closeSync, fsyncSync,
 } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
@@ -131,7 +131,7 @@ export function renderTimerUnits(record, script, parameters) {
       '',
       '[Service]',
       'Type=oneshot',
-      'SuccessExitStatus=2',              // apply exits 2 when drift remains (CH-18 low, CH-19 compaction due): it ran
+      'SuccessExitStatus=2',              // apply exits 2 when drift remains: it ran
       `ExecStart=${record.node} ${script} apply --scope=${scopes} --parameters=${parameters}`,
       'Nice=19',
       'IOSchedulingClass=idle',
@@ -332,39 +332,11 @@ function openPaths() {
 const mountPoints = () => readText('/proc/self/mountinfo').split('\n').map((l) => l.split(' ')[4]).filter(Boolean);
 const under = (paths, p) => paths.some((x) => x === p || x.startsWith(`${p}/`));
 
-// ---------- CH-18/CH-19 headroom ----------
-export const maintenanceReferral = record => record.headroom?.maintenanceReferral || 'Existing WSL host maintenance owner: exact-disk checkpoint, authority and physical reopening required; no maintenance is admitted here.';
-export function refuseAutomaticCollection(record) {
-  if (record.headroom?.guix || record.headroom?.compactCommand) throw new Error('unqualified automatic maintenance selector refused before effects; ' + maintenanceReferral(record));
-}
-const GB = (b) => `${(b / 1e9).toFixed(1)} GB`;
-
-/** Low when either side is under the floor. Legacy `slack`/`compact` fields
- * describe an apparent logical gap/referral, never allocation or reclaim. */
-export function judgeHeadroom({ vmFree, vmUsed, hostFree, imageBytes }, h) {
-  if (!Number.isFinite(h.floorBytes) || h.floorBytes <= 0) throw new Error('finite positive housekeeping floor required');
-  const slack = imageBytes == null ? null : Math.max(0, imageBytes - vmUsed);
-  return { low: Number.isFinite(vmFree) && Number.isFinite(hostFree) ? Math.min(vmFree, hostFree) < h.floorBytes : null, slack, compact: slack != null && slack > (h.compactAboveBytes ?? Infinity) };
-}
-
-/** Two statfs calls and one stat (CH-9). Null when the record declares no headroom. */
-export function observeHeadroom(record) {
-  const h = record.headroom;
-  if (!h) return null;
-  const space = (p) => { try { const s = statfsSync(p); return { free: s.bavail * s.bsize, used: (s.blocks - s.bfree) * s.bsize }; } catch { return null; } };
-  const vm = space(h.vmVolume), host = space(h.hostVolume);
-  const m = { vmFree: vm?.free ?? null, vmUsed: vm?.used ?? null, hostFree: host?.free ?? null, imageBytes: lstatOrNull(h.diskImage)?.size ?? null };
-  return { ...m, ...judgeHeadroom(m, h) };
-}
-
-/** The scratch idle limit in force: the record's days, or CH-18's hours while headroom is low. */
-export function scratchLimit(record, headroom) {
-  if (headroom && headroom.low === null) throw new Error('unknown pressure: scratch retirement held; ' + maintenanceReferral(record));
-  const days = record.scratch.idleDays, hours = record.headroom?.idleHours;
-  if (!Number.isFinite(days) || days <= 0 || (headroom?.low && (!Number.isFinite(hours) || hours <= 0 || hours > days * 24))) throw new Error('finite bounded scratch cutoff required');
-  return headroom?.low
-    ? { ms: record.headroom.idleHours * 3_600_000, text: `${record.headroom.idleHours} h` }
-    : { ms: record.scratch.idleDays * DAY_MS, text: `${record.scratch.idleDays} d` };
+/** The scratch idle limit: the record's days. */
+export function scratchLimit(record) {
+  const days = record.scratch.idleDays;
+  if (!Number.isFinite(days) || days <= 0) throw new Error('finite bounded scratch cutoff required');
+  return { ms: days * DAY_MS, text: `${days} d` };
 }
 
 /** Every top-level entry under each scratch root, measured and decided (CH-16). */
@@ -455,18 +427,10 @@ export async function observe(record, { script, parameters }) {
     }
   }
 
-  const headroom = observeHeadroom(record);
-  if (headroom) {
-    const h = record.headroom;
-    add('CH-18 headroom', headroom.low === false,
-      `VM ${GB(headroom.vmFree)} free, host ${headroom.hostFree == null ? 'unread' : `${GB(headroom.hostFree)} free`} (floor ${GB(h.floorBytes)})`);
-    add('CH-19 disk image', !headroom.compact, headroom.slack == null ? `${h.diskImage} unread; HELD maintenance: ${maintenanceReferral(record)}`
-      : `${GB(headroom.imageBytes)} image logical length, ${GB(headroom.slack)} apparent gap beyond ${GB(headroom.vmUsed)} guest used; Windows allocation/reclaim unknown (original WSL host plan)${headroom.compact ? `; HELD maintenance: ${maintenanceReferral(record)}` : ''}`);
-  }
   if (record.scratch) {
     let limit;
-    try { limit = scratchLimit(record, headroom); }
-    catch (error) { add('CH-18 scratch admission', false, error.message); return items; }
+    try { limit = scratchLimit(record); }
+    catch (error) { add('CH-16 scratch admission', false, error.message); return items; }
     for (const root of record.scratch.roots) {
       items.push({ id: `CH-16 scratch policy ${root.path}`, status: 'current', detail: root.retirementOwner
         ? `retirement delegated to ${root.retirementOwner}; no listing`
@@ -602,9 +566,6 @@ export async function applyScopes(record, scope, { script, parameters }, ports =
   const failures = [];
   const scopes = String(scope).split(',');
   const want = (s) => scopes.includes('all') || scopes.includes(s);
-  // Reject active legacy maintenance selectors before cleanup OR installing
-  // them as the future timer's record. Timer installation executes no cleanup.
-  if (want('scratch') || want('retention') || want('timer')) refuseAutomaticCollection(record);
 
   const steps = {
     async harness() {
@@ -668,15 +629,13 @@ export async function applyScopes(record, scope, { script, parameters }, ports =
 
     async scratch() {
       if (!record.scratch) return;
-      const headroom = observeHeadroom(record);
-      const observed = observeScratch(record, Date.now(), { idleMs: scratchLimit(record, headroom).ms });
+      const observed = observeScratch(record, Date.now(), { idleMs: scratchLimit(record).ms });
       const removed = removeExpired(observed, log);
       const kept = new Map();
       for (const x of observed.filter((e) => !e.expire)) {
         kept.set(x.reason, (kept.get(x.reason) ?? 0) + 1);
       }
       notes.push(`scratch: ${removed} expired, ${[...kept.values()].reduce((a, b) => a + b, 0)} kept of ${observed.length} entries${kept.size ? ` (${[...kept].map(([why, n]) => `${n} ${why}`).join('; ')})` : ''}`);
-      if (headroom?.low || headroom?.compact) log.push('HELD maintenance: ' + maintenanceReferral(record));
     },
 
     async workspace() {
