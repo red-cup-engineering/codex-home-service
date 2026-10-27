@@ -54,6 +54,7 @@ test('an unrelated later scope is installed although scratch failed (CH-32)', as
   fs.writeFileSync(join(source, 'package.json'), '{"name":"fixture"}\n');
   fs.writeFileSync(join(source, 'src/codex-home.mjs'), '// src\n');
   fs.writeFileSync(join(source, 'src/thread-provider.mjs'), '// provider\n');
+  fs.writeFileSync(join(source, 'src/git-maintenance-hold.mjs'), '// native Git hold\n');
   fs.writeFileSync(entry, '// cli\n');
   const base = failingRetention(root), record = { ...base, scratch: { ...base.scratch, idleDays: 0 } };
   fs.writeFileSync(parameters, JSON.stringify(record));
