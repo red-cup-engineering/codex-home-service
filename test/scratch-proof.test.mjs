@@ -14,7 +14,7 @@ const old = new Date(0);
 const idle = (p) => fs.utimesSync(p, old, old);
 
 test('the proof budget is bounded integers and defaults to the original limits (CH-34)', () => {
-  assert.deepEqual(scratchProofBudget({ scratch: {} }), { entryReads: 1024, entryDirs: 256, entryMs: 250, totalMs: 250, checkoutMs: 5000 });
+  assert.deepEqual(scratchProofBudget({ scratch: {} }), { entryReads: 1_000_000, entryDirs: 1_000_000, entryMs: 10_000, totalMs: 120_000, checkoutMs: 120_000 });
   assert.equal(scratchProofBudget({ scratch: { proofBudget: { entryReads: 5000 } } }).entryReads, 5000);
   for (const bad of [{ entryReads: 0 }, { entryReads: 1.5 }, { entryMs: 1e9 }, { totalMs: '30000' }, { bytes: 10 }, []])
     assert.throws(() => scratchProofBudget({ scratch: { proofBudget: bad } }), /proofBudget/);
@@ -37,8 +37,8 @@ test('one entry too large to prove idle is held alone and never leaves the other
   for (const p of [big, small, many]) idle(p);
   const decide = (proofBudget) => Object.fromEntries(observeScratch({ scratch: { idleDays: 2, proofBudget: { totalMs: 20000 }, roots: [{ path: root, ...(proofBudget ? { proofBudget } : {}) }] } }, Date.now(), { readRootEntries: () => ['a-big', 'm-many-dirs', 'z-small'] })
     .map((e) => [e.name, e.expire ? 'expire' : e.reason]));
-  assert.deepEqual(decide(), { 'a-big': 'too large to prove idle', 'm-many-dirs': 'too large to prove idle', 'z-small': 'expire' });
-  assert.deepEqual(decide({ entryReads: 5000, entryDirs: 1000, entryMs: 5000 }), { 'a-big': 'expire', 'm-many-dirs': 'expire', 'z-small': 'expire' });
+  assert.deepEqual(decide({ entryReads: 1024, entryDirs: 256, entryMs: 250 }), { 'a-big': 'too large to prove idle', 'm-many-dirs': 'too large to prove idle', 'z-small': 'expire' });
+  assert.deepEqual(decide(), { 'a-big': 'expire', 'm-many-dirs': 'expire', 'z-small': 'expire' });
 });
 
 test('a blobless checkout is proven clean and pushed, or held, without fetching (CH-34)', () => {
