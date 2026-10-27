@@ -73,7 +73,7 @@ if(args.includes('status')){fs.writeFileSync(${JSON.stringify(pidFile)},String(p
 else{const result=spawnSync(${JSON.stringify(realGit)},args,{stdio:'inherit'});process.exit(result.status??1);}\n`;
   fs.writeFileSync(path.join(bin,'git'),wrapper,{mode:0o700});process.env.PATH=bin+path.delimiter+originalPath;
   try{
-   const started=performance.now(),result=checkoutState(root);
+   const started=performance.now(),result=checkoutState(root,root,{childTimeoutMs:500});
    assert.equal(result.ok,false);assert.match(result.reason,/unknown or exceeded its read budget/);assert.ok(performance.now()-started<5000);
    const pid=Number(fs.readFileSync(pidFile,'utf8'));assert.throws(()=>process.kill(pid,0),{code:'ESRCH'});
   }finally{process.env.PATH=originalPath;}

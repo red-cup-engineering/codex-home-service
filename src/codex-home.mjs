@@ -322,12 +322,15 @@ function installPlan(record, { script, parameters }) {
 const MB = (b) => `${(b / 1e6).toFixed(0)} MB`;
 
 // ---------- CH-16 agent scratch ----------
-const SCRATCH_DEPTH = 8;
-const SCRATCH_DIR_LIMIT = 256;
+// Deep enough that no checkout nested in agent scratch escapes the search for repositories.
+const SCRATCH_DEPTH = 64;
+const SCRATCH_DIR_LIMIT = 1_000_000;
 
 // CH-34: what one scratch apply may spend proving entries idle. The defaults are the original aggregate limits
 // (applied per entry); the record may widen them, within the maxima, from what its host measured.
-const PROOF_DEFAULTS = Object.freeze({ entryReads: 1024, entryDirs: SCRATCH_DIR_LIMIT, entryMs: 250, totalMs: 250, checkoutMs: 5000 });
+// An hourly background job may spend seconds proving scratch idle. Budgets sized for an interactive
+// command left every real scratch tree 'too large to prove idle' and so kept forever.
+const PROOF_DEFAULTS = Object.freeze({ entryReads: 1_000_000, entryDirs: SCRATCH_DIR_LIMIT, entryMs: 10_000, totalMs: 120_000, checkoutMs: 120_000 });
 const PROOF_MAXIMA = Object.freeze({ entryReads: 1_000_000, entryDirs: 1_000_000, entryMs: 10_000, totalMs: 120_000, checkoutMs: 120_000 });
 export function scratchProofBudget(record, root = null) {
   const out = { ...PROOF_DEFAULTS };
@@ -404,7 +407,7 @@ export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimi
  * A git checkout in scratch may go only when clean and with every commit on a remote (CH-16), or, for a linked
  * worktree whose repository lies outside the scratch `entry`, on a branch that removing the entry leaves (CH-21).
  */
-export function checkoutState(root, entry = root, { protectedRoots = [], budget = { deadline: performance.now() + 5000 }, childTimeoutMs = 500 } = {}) {
+export function checkoutState(root, entry = root, { protectedRoots = [], budget = { deadline: performance.now() + 5000 }, childTimeoutMs = 10_000 } = {}) {
   const held = (reason, common = null) => ({ path: root, ok: false, reason, common });
   const contains = (parent, child) => { const r = relative(parent, child); return !r || (r !== '..' && !r.startsWith('../') && !r.startsWith('/')); };
   let realRoot, realEntry;
@@ -413,7 +416,7 @@ export function checkoutState(root, entry = root, { protectedRoots = [], budget 
     if (!contains(realEntry, realRoot) || protectedRoots.some(p => contains(realRoot, realpathSync(p))))
       return held('checkout scope is outside scratch or protects a home/workspace');
   } catch { return held('checkout scope is unknown'); }
-  if (!Number.isInteger(childTimeoutMs) || childTimeoutMs < 1 || childTimeoutMs > 500 || !Number.isFinite(budget.deadline))
+  if (!Number.isInteger(childTimeoutMs) || childTimeoutMs < 1 || childTimeoutMs > 30_000 || !Number.isFinite(budget.deadline))
     return held('checkout read budget is invalid');
   const dotGit = join(root, '.git');
   const gitdir = gitDirOf(dotGit);
