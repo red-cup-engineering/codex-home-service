@@ -6,7 +6,7 @@ export const THREAD_SOURCES = Object.freeze(['cli', 'vscode', 'exec', 'appServer
 
 /** One provider connection, no model turn, history load, storage fallback or retry. Every request is bounded
  * by its own deadline and output budget, so the session's length follows the work, not a fixed allowance. */
-export async function withThreadProvider({ binary, home, timeoutMs = 5000, maximumBytes = 2 * 1024 * 1024 }, operation) {
+export async function withThreadProvider({ binary, home, timeoutMs = 60000, maximumBytes = 2 * 1024 * 1024 }, operation) {
   if (typeof binary !== 'string' || !binary.startsWith('/') || typeof home !== 'string' || !home.startsWith('/')) throw new Error('exact native Codex binary and home required');
   const child = spawn(binary, ['app-server', '--listen', 'stdio://'], { cwd: home, env: { ...process.env, CODEX_HOME: home }, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
   const pending = new Map();
