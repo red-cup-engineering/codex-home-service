@@ -12,7 +12,7 @@ const fixture = () => { const root = fs.mkdtempSync(join(tmpdir(), 'independent-
 test.after(() => { for (const root of roots) fs.rmSync(root, { recursive: true, force: true }); });
 const script = fileURLToPath(new URL('../scripts/codex-home.mjs', import.meta.url));
 const old = new Date(0);
-const idleEntry = (dir, name) => { const p = join(dir, name); fs.mkdirSync(p, { recursive: true }); fs.writeFileSync(join(p, 'f'), name); fs.utimesSync(join(p, 'f'), old, old); fs.utimesSync(p, old, old); return p; };
+const idleEntry = (dir, name) => { const p = join(dir, name); fs.mkdirSync(p, { recursive: true }); fs.utimesSync(p, old, old); return p; };
 
 // A record whose retention scope must fail (no Codex binary to ask) and whose scratch scope has work to do.
 function failingRetention(root) {
