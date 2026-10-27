@@ -1,12 +1,12 @@
 // Codex home service: keeps a Codex home's placement, login link, searched data, workspace scans and plugin
-// servers and agent scratch bounded, from one parameter record (specifications/requirements.md, CH-1..CH-22).
+// servers and agent scratch bounded, from one parameter record (specifications/requirements.md).
 // Node built-ins only.
 import {
   readFileSync, writeFileSync, existsSync, lstatSync, statSync, readdirSync, mkdirSync, renameSync,
   rmSync, readlinkSync, symlinkSync, statfsSync,
-  openSync, closeSync, fsyncSync, realpathSync, opendirSync,
+  openSync, closeSync, fsyncSync,
 } from 'node:fs';
-import { join, dirname, relative, resolve } from 'node:path';
+import { join, dirname, relative } from 'node:path';
 import { homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -119,19 +119,6 @@ export function selectRetention(threads, filesByPath, nowMs, idleDays) {
 /** Files in the searched folder that no thread references and that have been idle for a day. */
 export function selectLegacy(files, referenced, nowMs) {
   return files.filter((f) => !referenced.has(f.path) && nowMs - f.mtimeMs > DAY_MS);
-}
-
-/** CH-16: one scratch entry's fate from what the host observers measured. Returns { expire, reason }. */
-export function decideScratch(e) {
-  if (e.declaredKeep) return { expire: false, reason: 'kept by the record' };
-  if (e.mount) return { expire: false, reason: 'a filesystem is mounted inside' };
-  if (e.inUse) return { expire: false, reason: 'open in a running process' };
-  if (e.liveSession) return { expire: false, reason: 'belongs to a running session' };
-  if (!e.activity.complete) return { expire: false, reason: 'too large to prove idle' };
-  if (e.activity.recent) return { expire: false, reason: 'active' };
-  const held = e.checkouts.find((c) => !c.ok);
-  if (held) return { expire: false, reason: `${held.reason} in ${held.path}` };
-  return { expire: true, reason: `unchanged since ${new Date(e.activity.newestMs).toISOString().slice(0, 10)}` };
 }
 
 export function renderTimerUnits(record, script, parameters) {
@@ -322,137 +309,13 @@ function installPlan(record, { script, parameters }) {
 const MB = (b) => `${(b / 1e6).toFixed(0)} MB`;
 
 // ---------- CH-16 agent scratch ----------
-// Deep enough that no checkout nested in agent scratch escapes the search for repositories.
-const SCRATCH_DEPTH = 64;
-const SCRATCH_DIR_LIMIT = 1_000_000;
-
-// CH-34: what one scratch apply may spend proving entries idle. The defaults are the original aggregate limits
-// (applied per entry); the record may widen them, within the maxima, from what its host measured.
-// An hourly background job may spend seconds proving scratch idle. Budgets sized for an interactive
-// command left every real scratch tree 'too large to prove idle' and so kept forever.
-const PROOF_DEFAULTS = Object.freeze({ entryReads: 1_000_000, entryDirs: SCRATCH_DIR_LIMIT, entryMs: 10_000, totalMs: 120_000, checkoutMs: 120_000 });
-const PROOF_MAXIMA = Object.freeze({ entryReads: 1_000_000, entryDirs: 1_000_000, entryMs: 10_000, totalMs: 120_000, checkoutMs: 120_000 });
-export function scratchProofBudget(record, root = null) {
-  const out = { ...PROOF_DEFAULTS };
-  const take = (declared, keys, where) => {
-    if (typeof declared !== 'object' || declared === null || Array.isArray(declared)) throw new TypeError(`${where} must be an object`);
-    for (const [key, value] of Object.entries(declared)) {
-      if (!keys.includes(key) || !Number.isSafeInteger(value) || value < 1 || value > PROOF_MAXIMA[key])
-        throw new TypeError(`${where} admits ${keys.join(', ')} as integers from 1 to their maxima (${keys.map((k) => `${k} ${PROOF_MAXIMA[k]}`).join(', ')})`);
-      out[key] = value;
-    }
-  };
-  take(record.scratch?.proofBudget ?? {}, Object.keys(PROOF_DEFAULTS), 'scratch proofBudget');
-  // A root may widen only what one of its entries may spend; the run's time and git budgets are the record's alone.
-  if (root) take(root.proofBudget ?? {}, ['entryReads', 'entryDirs', 'entryMs'], 'scratch root proofBudget');
-  return out;
-}
-/** The record's scratch declarations (CH-25, CH-33, CH-34), all refused when any one is malformed. */
-export function validateScratch(record) {
-  scratchRetirementOwners(record);
-  scratchLiveSessionFlags(record);
-  for (const root of [null, ...(record.scratch?.roots ?? [])]) scratchProofBudget(record, root);
-}
-
-/** The git directory a `.git` entry names: itself, or the target of a `gitdir:` file (null when that is gone). */
-function gitDirOf(dotGit) {
-  const st = lstatOrNull(dotGit);
-  if (!st?.isFile()) return st ? dotGit : null;
-  const m = /^gitdir: (.+)$/m.exec(readText(dotGit));
-  const dir = m ? resolve(dirname(dotGit), m[1].trim()) : null;
-  return dir && existsSync(dir) ? dir : null;
-}
-
-/**
- * Newest change in a scratch entry: directory mtimes (they move on every create, delete and rename), the entry's
- * own files, and each checkout's index and HEAD log (they move on every stage, commit and checkout), to
- * SCRATCH_DEPTH levels, without entering the directories named in `opaque` (CH-20). Stops at the first change after
- * `cutoffMs`, so an active entry costs a few reads (CH-9).
- */
-export function scratchActivity(path, cutoffMs, { depth = SCRATCH_DEPTH, dirLimit = SCRATCH_DIR_LIMIT, opaque = new Set(), budget = { deadline: performance.now() + 250, remaining: 1024 } } = {}) {
-  if (performance.now() >= budget.deadline || budget.remaining <= 0) return { newestMs: 0, recent: false, complete: false, repos: [] };
-  const st = lstatSync(path);
-  let newest = st.mtimeMs, seen = 0;
-  const repos = [];
-  const done = (complete) => ({ newestMs: newest, recent: newest > cutoffMs, complete, repos });
-  if (!st.isDirectory()) return done(true);
-  const queue = [[path, 0]];
-  for (let i = 0; i < queue.length; i++) {
-    if (newest > cutoffMs) return done(true);
-    const [dir, level] = queue[i];
-    let handle;
-    try { handle = opendirSync(dir); } catch { return done(false); }
-    try { for (;;) {
-      if (performance.now() >= budget.deadline || budget.remaining-- <= 0) return done(false);
-      const e = handle.readSync();
-      if (!e) break;
-      const p = join(dir, e.name);
-      if (e.name === '.git') {
-        repos.push(dir);
-        const g = gitDirOf(p);
-        if (g) for (const f of ['index', 'HEAD', join('logs', 'HEAD')]) newest = Math.max(newest, lstatOrNull(join(g, f))?.mtimeMs ?? 0);
-      } else if (e.isDirectory()) {
-        newest = Math.max(newest, lstatOrNull(p)?.mtimeMs ?? 0);
-        if (++seen > dirLimit) return done(false);
-        if (level + 1 < depth && !opaque.has(e.name)) queue.push([p, level + 1]);
-      } else if (level === 0) {
-        newest = Math.max(newest, lstatOrNull(p)?.mtimeMs ?? 0);
-      }
-    } } finally { handle.closeSync(); }
-  }
-  return done(true);
-}
-
-/**
- * A git checkout in scratch may go only when clean and with every commit on a remote (CH-16), or, for a linked
- * worktree whose repository lies outside the scratch `entry`, on a branch that removing the entry leaves (CH-21).
- */
-export function checkoutState(root, entry = root, { protectedRoots = [], budget = { deadline: performance.now() + 5000 }, childTimeoutMs = 10_000 } = {}) {
-  const held = (reason, common = null) => ({ path: root, ok: false, reason, common });
-  const contains = (parent, child) => { const r = relative(parent, child); return !r || (r !== '..' && !r.startsWith('../') && !r.startsWith('/')); };
-  let realRoot, realEntry;
-  try {
-    realRoot = realpathSync(root); realEntry = realpathSync(entry);
-    if (!contains(realEntry, realRoot) || protectedRoots.some(p => contains(realRoot, realpathSync(p))))
-      return held('checkout scope is outside scratch or protects a home/workspace');
-  } catch { return held('checkout scope is unknown'); }
-  if (!Number.isInteger(childTimeoutMs) || childTimeoutMs < 1 || childTimeoutMs > 30_000 || !Number.isFinite(budget.deadline))
-    return held('checkout read budget is invalid');
-  const dotGit = join(root, '.git');
-  const gitdir = gitDirOf(dotGit);
-  if (!gitdir) return { path: root, ok: true, reason: 'git metadata already gone', common: null };
-  const common = existsSync(join(gitdir, 'commondir')) ? resolve(gitdir, readText(join(gitdir, 'commondir')).trim()) : gitdir;
-  const env = { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' };
-  for (const name of Object.keys(env)) if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG|CONFIG_PARAMETERS|CONFIG_COUNT|CONFIG_KEY_.*|CONFIG_VALUE_.*|TRACE.*|EXEC_PATH)$/.test(name)) delete env[name];
-  const prefix = ['--no-pager', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
-    '-c', 'core.untrackedCache=false', '-c', 'core.preloadIndex=false', '-c', 'submodule.recurse=false', '-c', 'protocol.allow=never', '-C', realRoot];
-  const git = (args, allowEmpty = false) => {
-    const left = Math.floor(budget.deadline - performance.now());
-    if (left < 1) throw new Error('checkout read budget exhausted');
-    try {
-      return execFileSync('git', [...prefix, ...args], { encoding: 'utf8', env, timeout: Math.min(childTimeoutMs, left),
-        killSignal: 'SIGKILL', maxBuffer: 65536, stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (error) {
-      if (allowEmpty && error.status === 1 && !error.signal && error.stdout?.length === 0 && !error.stderr?.length) return '';
-      throw error;
-    }
-  };
-  try {
-    if (realpathSync(git(['rev-parse', '--show-toplevel']).trim()) !== realRoot) return held('native checkout scope differs', common);
-    // Filters can spawn unbounded descendants, which is no read-only bounded proof even when their parent Git is timed
-    // out. A partial clone (the house clones blobless) can fetch, but every git call above runs with all transports
-    // refused, so a read that needs a missing object fails and the checkout stays held instead of fetching (CH-34).
-    if (git(['config', '--get-regexp', '^filter\\..*\\.(clean|process)$'], true))
-      return held('checkout filters are unreceived', common);
-    if (git(['ls-files', '--stage', '-z']).split('\0').some(row => row.startsWith('160000 ')))
-      return held('submodule checkout proof is unknown', common);
-    if (git(['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignore-submodules=all', '--no-renames'])) return { path: root, ok: false, reason: 'uncommitted changes', common };
-    const outside = !`${common}/`.startsWith(`${resolve(entry)}/`);
-    if (git(['rev-list', '-n', '1', 'HEAD', '--not', '--remotes', ...(outside ? ['--branches'] : [])])) {
-      return { path: root, ok: false, reason: outside ? 'commits on no remote or branch' : 'commits on no remote', common };
-    }
-  } catch { return held('checkout proof is unknown or exceeded its read budget', common); }
-  return { path: root, ok: true, reason: 'clean and pushed', common };
+/** Newest mtime among a scratch entry and its immediate children: two levels of lstat, never a tree walk. */
+export function scratchNewestMs(path) {
+  let newest = lstatSync(path).mtimeMs;
+  let names = [];
+  try { names = readdirSync(path); } catch { /* a file, or unreadable: the entry's own mtime stands */ }
+  for (const name of names) newest = Math.max(newest, lstatOrNull(join(path, name))?.mtimeMs ?? 0);
+  return newest;
 }
 
 function openPaths() {
@@ -468,28 +331,6 @@ function openPaths() {
 }
 const mountPoints = () => readText('/proc/self/mountinfo').split('\n').map((l) => l.split(' ')[4]).filter(Boolean);
 const under = (paths, p) => paths.some((x) => x === p || x.startsWith(`${p}/`));
-
-/**
- * CH-33: the session ids of the running processes, read from `proc` as the values of the long options in `flags`
- * (`--session-id=<id>`, `--resume=<id>`, or the option and the id as two arguments). A session's scratch folder is
- * named by its id, and an open file is only incidental evidence that an idle session is running.
- */
-export function runningSessionIds(flags, proc = '/proc') {
-  const names = flags.map((f) => f.replace(/=$/, ''));
-  const ids = new Set();
-  for (const pid of readdirSync(proc).filter((d) => /^\d+$/.test(d))) {
-    let argv;
-    try { argv = readFileSync(join(proc, pid, 'cmdline'), 'utf8').split('\0'); } catch { continue; }
-    argv.forEach((arg, i) => {
-      for (const name of names) {
-        if (arg.startsWith(`${name}=`)) ids.add(arg.slice(name.length + 1));
-        else if (arg === name && argv[i + 1]) ids.add(argv[i + 1]);
-      }
-    });
-  }
-  ids.delete('');
-  return ids;
-}
 
 // ---------- CH-18/CH-19 headroom ----------
 export const maintenanceReferral = record => record.headroom?.maintenanceReferral || 'Existing WSL host maintenance owner: exact-disk checkpoint, authority and physical reopening required; no maintenance is admitted here.';
@@ -540,52 +381,25 @@ export function scratchRetirementOwners(record) {
   });
 }
 
-/** Per root, the long options that name a running session whose folder it holds (CH-33), or null. Malformed refuses. */
-export function scratchLiveSessionFlags(record) {
-  return (record.scratch?.roots ?? []).map(root => {
-    if (!Object.hasOwn(root, 'liveSessionFlags')) return null;
-    const flags = root.liveSessionFlags;
-    if (!Array.isArray(flags) || !flags.length || flags.length > 8 || !flags.every(f => typeof f === 'string' && /^--[a-z][a-z0-9-]*=?$/.test(f)))
-      throw new TypeError('scratch liveSessionFlags must list long option names');
-    return flags;
-  });
-}
-
-export function observeScratch(record, now = Date.now(), { idleMs = record.scratch?.idleDays * DAY_MS, readRootEntries = readdirSync, processRoot = '/proc' } = {}) {
+/** Every top-level entry under each scratch root, with its fate (CH-16): older than `idleMs`, and not kept, mounted or some process's cwd or open file. */
+export function observeScratch(record, now = Date.now(), { idleMs = record.scratch?.idleDays * DAY_MS, readRootEntries = readdirSync } = {}) {
   const s = record.scratch;
   if (!s) return [];
-  const owners = scratchRetirementOwners(record), sessionFlags = scratchLiveSessionFlags(record);
+  const owners = scratchRetirementOwners(record);
   const cutoffMs = now - idleMs;
   const active = owners.some(owner => !owner);
-  const open = active ? openPaths() : [], mounts = active ? mountPoints() : [], opaque = new Set(s.opaqueDirs ?? []);
-  const proof = scratchProofBudget(record), started = performance.now();
-  const rootProof = s.roots.map((root) => scratchProofBudget(record, root));
-  const budget = { deadline: started + proof.checkoutMs };
-  // Each entry is proven within its own reads and time, under one overall deadline, so a large idle entry is held
-  // alone instead of leaving every entry after it unproven in every run (CH-34).
-  const activityBudget = (index) => ({ deadline: Math.min(performance.now() + rootProof[index].entryMs, started + proof.totalMs), remaining: rootProof[index].entryReads });
-  const protectedRoots = [record.home, ...(record.workspaces ?? []).map(ws => ws.path)].filter(Boolean);
+  const open = active ? openPaths() : [], mounts = active ? mountPoints() : [];
   const admits = (root, name) => !root.match || new RegExp(root.match).test(name);
-  const running = new Map();   // one /proc read per distinct flag set
-  const runs = (index, name) => {
-    const flags = sessionFlags[index];
-    if (!flags) return false;
-    const key = flags.join(' ');
-    if (!running.has(key)) running.set(key, runningSessionIds(flags, processRoot));
-    return running.get(key).has(name);
-  };
   return s.roots.flatMap((root, index) => {
     if (owners[index]) return [{ root: root.path, name: '', path: root.path, expire: false, retirementOwner: owners[index], reason: 'retirement delegated to ' + owners[index] }];
     return (existsSync(root.path) ? readRootEntries(root.path) : []).filter((name) => admits(root, name)).map((name) => {
-    const path = join(root.path, name);
-    const e = { root: root.path, name, path, declaredKeep: (root.keep ?? []).includes(name), mount: under(mounts, path), inUse: under(open, path), liveSession: runs(index, name) };
-    let activity = { newestMs: 0, recent: false, complete: true, repos: [] }, checkouts = [];
-    if (!e.declaredKeep && !e.mount && !e.inUse && !e.liveSession) {
-      activity = scratchActivity(path, cutoffMs, { opaque, dirLimit: rootProof[index].entryDirs, budget: activityBudget(index) });
-      if (activity.complete && !activity.recent) checkouts = activity.repos.map((repo) => checkoutState(repo, path, { protectedRoots, budget }));
-    }
-    const full = { ...e, activity, checkouts };
-    return { ...full, ...decideScratch(full) };
+      const path = join(root.path, name), e = { root: root.path, name, path };
+      if ((root.keep ?? []).includes(name)) return { ...e, expire: false, reason: 'kept by the record' };
+      if (under(mounts, path)) return { ...e, expire: false, reason: 'a filesystem is mounted inside' };
+      if (under(open, path)) return { ...e, expire: false, reason: 'open in a running process' };
+      let newestMs;
+      try { newestMs = scratchNewestMs(path); } catch { return { ...e, expire: false, reason: 'gone' }; }
+      return newestMs > cutoffMs ? { ...e, expire: false, reason: 'active' } : { ...e, expire: true, reason: `unchanged since ${new Date(newestMs).toISOString().slice(0, 10)}` };
     });
   });
 }
@@ -656,7 +470,7 @@ export async function observe(record, { script, parameters }) {
     for (const root of record.scratch.roots) {
       items.push({ id: `CH-16 scratch policy ${root.path}`, status: 'current', detail: root.retirementOwner
         ? `retirement delegated to ${root.retirementOwner}; no listing`
-        : `not inspected by health plan; scoped scratch apply owns idle > ${limit.text} proof` });
+        : `not inspected by health plan; scoped scratch apply removes entries idle > ${limit.text}` });
     }
   }
 
@@ -723,9 +537,8 @@ function writeIfChanged(path, text, log, label) {
   return true;
 }
 
-/** Remove the entries `observeScratch` decided to expire, then let git drop the worktree registrations they leave. Returns the count removed. */
+/** Remove the entries `observeScratch` decided to expire. Returns the count removed. */
 function removeExpired(observed, log) {
-  const commons = new Set();
   let removed = 0;
   for (const x of observed.filter((e) => e.expire)) {
     try {
@@ -733,12 +546,6 @@ function removeExpired(observed, log) {
       removed++;
       log.push(`expired ${x.path} (${x.reason})`);
     } catch (err) { log.push(`could not remove ${x.path}: ${err.code ?? err.message}`); }
-    for (const c of x.checkouts) if (c.common) commons.add(c.common);
-  }
-  // Removed worktrees leave registrations behind in their repository; git's own prune drops them.
-  for (const c of commons) {
-    if (!existsSync(c)) continue;
-    try { execFileSync('git', ['--git-dir', c, 'worktree', 'prune'], { stdio: 'ignore' }); log.push(`git worktree prune ${c}`); } catch { log.push(`git worktree prune failed for ${c}`); }
   }
   return removed;
 }
@@ -746,16 +553,15 @@ function removeExpired(observed, log) {
 const processGone = (pid, proc) => !existsSync(join(proc, String(pid)));
 
 /**
- * CH-35: an event, not a clock, retires one session's scratch: the entry named `session` in each root that names
- * `liveSessionFlags`, with no idle wait, through the same guards as the scratch scope (kept, mounted, open, running
- * under that id, uncommitted or unpushed git work). With `afterPid` it first waits, up to `waitMs`, for that process
+ * CH-35: an event, not a clock, retires one session's scratch: the entry named `session` in each root not delegated
+ * to a retirement owner, with no idle wait, through the same guards as the scratch scope (kept, mounted, open). With `afterPid` it first waits, up to `waitMs`, for that process
  * (the ending session itself) to exit, because a session's own process still holds its folder when SessionEnd fires.
  * Returns { removed, held: [{ path, reason }], log }.
  */
 export async function retireSession(record, { session, afterPid = null, waitMs = 600_000, processRoot = '/proc', pollMs = 200 }) {
-  validateScratch(record);
+  scratchRetirementOwners(record);
   if (typeof session !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(session)) throw new TypeError('a session id of letters, digits and ._- is required');
-  const roots = (record.scratch?.roots ?? []).filter((r) => r.liveSessionFlags && !r.retirementOwner);
+  const roots = (record.scratch?.roots ?? []).filter((r) => !r.retirementOwner);
   const log = [], held = [];
   const deadline = performance.now() + waitMs;
   while (afterPid && !processGone(afterPid, processRoot)) {
@@ -765,7 +571,7 @@ export async function retireSession(record, { session, afterPid = null, waitMs =
   let removed = 0;
   for (const root of roots) {
     if (!existsSync(join(root.path, session))) continue;
-    const observed = observeScratch({ ...record, scratch: { ...record.scratch, roots: [root] } }, Date.now(), { idleMs: 0, readRootEntries: () => [session], processRoot });
+    const observed = observeScratch({ ...record, scratch: { ...record.scratch, roots: [root] } }, Date.now(), { idleMs: 0, readRootEntries: () => [session] });
     removed += removeExpired(observed, log);
     for (const x of observed.filter((e) => !e.expire)) held.push({ path: x.path, reason: x.reason });
   }
@@ -786,12 +592,11 @@ export class ApplyFailed extends Error {
 }
 
 /**
- * CH-32: refuse the record before any effect (legacy maintenance selectors, malformed retirement owners or
- * session flags: CH-23, CH-25, CH-33), then run each selected scope on its own. One scope's failure is reported
+ * CH-32: refuse the record before any effect (legacy maintenance selectors, malformed retirement owners: CH-23, CH-25), then run each selected scope on its own. One scope's failure is reported
  * and the others still run. Returns { log: what changed, notes: what was seen and left, failures: [{ scope, error }] }.
  */
 export async function applyScopes(record, scope, { script, parameters }, ports = {}) {
-  validateScratch(record);
+  scratchRetirementOwners(record);
   const log = [];
   const notes = [];
   const failures = [];
@@ -868,8 +673,7 @@ export async function applyScopes(record, scope, { script, parameters }, ports =
       const removed = removeExpired(observed, log);
       const kept = new Map();
       for (const x of observed.filter((e) => !e.expire)) {
-        const why = x.reason.replace(/ in \/.*$/, '');      // a checkout's reason names its path; count the reason
-        kept.set(why, (kept.get(why) ?? 0) + 1);
+        kept.set(x.reason, (kept.get(x.reason) ?? 0) + 1);
       }
       notes.push(`scratch: ${removed} expired, ${[...kept.values()].reduce((a, b) => a + b, 0)} kept of ${observed.length} entries${kept.size ? ` (${[...kept].map(([why, n]) => `${n} ${why}`).join('; ')})` : ''}`);
       if (headroom?.low || headroom?.compact) log.push('HELD maintenance: ' + maintenanceReferral(record));

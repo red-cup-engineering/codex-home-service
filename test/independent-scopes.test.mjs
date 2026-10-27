@@ -3,10 +3,9 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { spawn, spawnSync } from 'node:child_process';
-import { once } from 'node:events';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { apply, applyScopes, ApplyFailed, decideScratch, observeScratch, runningSessionIds } from '../src/codex-home.mjs';
+import { apply, applyScopes, ApplyFailed } from '../src/codex-home.mjs';
 
 const roots = [];
 const fixture = () => { const root = fs.mkdtempSync(join(tmpdir(), 'independent-scopes-')); roots.push(root); return root; };
@@ -80,13 +79,6 @@ test('apply keeps returning the log, and throws ApplyFailed carrying the log and
   assert.equal(fs.existsSync(entry), false);
 });
 
-test('a record that is refused outright still stops every scope before its effects', async () => {
-  const root = fixture(), record = failingRetention(root), entry = idleEntry(record.scratch.roots[0].path, 'idle-task');
-  record.scratch.roots[0].liveSessionFlags = ['not-a-long-option'];
-  await assert.rejects(applyScopes(record, 'scratch,timer', { script, parameters: '/unused' }, { systemctlUser() { throw new Error('must not run'); } }), /liveSessionFlags must list long option names/);
-  assert.equal(fs.existsSync(entry), true);
-});
-
 test('the command exits non-zero after a failed scope while the other scopes have done their work (CH-32)', () => {
   const root = fixture(), record = failingRetention(root), entry = idleEntry(record.scratch.roots[0].path, 'idle-task');
   const parameters = join(root, 'record.json');
@@ -98,32 +90,4 @@ test('the command exits non-zero after a failed scope while the other scopes hav
   assert.match(run.stdout, /scratch: 1 expired, 0 kept of 1 entries/);
   assert.match(run.stderr, /scope retention failed: exact native Codex binary and home required/);
   assert.equal(fs.existsSync(entry), false);
-});
-
-test('an entry named by a running session is kept, and goes once that session has ended (CH-33)', async () => {
-  const root = fixture(), scratch = join(root, 'scratch');
-  const live = 'aaaaaaaa-1111-4111-8111-111111111111', resumed = 'bbbbbbbb-2222-4222-8222-222222222222', gone = 'cccccccc-3333-4333-8333-333333333333';
-  for (const name of [live, resumed, gone]) idleEntry(scratch, name);
-  const record = { home: join(root, 'home'), scratch: { idleDays: 2, roots: [{ path: scratch, liveSessionFlags: ['--session-id', '--resume='] }] } };
-  const hold = ['-e', 'setTimeout(() => {}, 120000)', '--'];
-  const children = [spawn(process.execPath, [...hold, `--session-id=${live}`], { stdio: 'ignore' }), spawn(process.execPath, [...hold, '--resume', resumed], { stdio: 'ignore' })];
-  try {
-    await Promise.all(children.map((c) => once(c, 'spawn')));
-    assert.deepEqual([...runningSessionIds(['--session-id', '--resume'])].filter((id) => [live, resumed, gone].includes(id)).sort(), [live, resumed]);
-    const seen = Object.fromEntries(observeScratch(record).map((e) => [e.name, e]));
-    assert.deepEqual([seen[live].expire, seen[resumed].expire, seen[gone].expire], [false, false, true]);
-    assert.equal(seen[live].reason, 'belongs to a running session');
-    assert.equal(seen[resumed].reason, 'belongs to a running session');
-  } finally {
-    for (const c of children) c.kill('SIGKILL');
-    await Promise.all(children.map((c) => (c.exitCode === null && c.signalCode === null ? once(c, 'exit') : null)));
-  }
-  assert.ok(observeScratch(record).every((e) => e.expire));
-});
-
-test('a running session outranks idleness but not the record: decideScratch order', () => {
-  const idle = { declaredKeep: false, mount: false, inUse: false, activity: { complete: true, recent: false, newestMs: 0 }, checkouts: [] };
-  assert.equal(decideScratch({ ...idle, liveSession: true }).reason, 'belongs to a running session');
-  assert.equal(decideScratch({ ...idle, liveSession: true, declaredKeep: true }).reason, 'kept by the record');
-  assert.equal(decideScratch({ ...idle, liveSession: false }).expire, true);
 });
