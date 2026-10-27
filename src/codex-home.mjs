@@ -11,6 +11,7 @@ import { homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { listProviderThreads, withThreadProvider } from './thread-provider.mjs';
+import { receiveWorkspaceGit, recheckWorkspaceGit, gitMaintenanceHoldState, applyGitMaintenanceHold, runWorkspaceGit } from './git-maintenance-hold.mjs';
 
 export const BEGIN = '# BEGIN codex-home-service (managed: change the parameter record, not this block)';
 export const END = '# END codex-home-service';
@@ -208,8 +209,8 @@ export function codexBinary(glob) {
 export function uncoveredPacks(packs, midxMtimeMs) {
   return midxMtimeMs == null ? packs.length : packs.filter((p) => p.mtimeMs > midxMtimeMs).length;
 }
-function gitMaintenanceState(repo) {
-  const packDir = join(repo, '.git', 'objects', 'pack');
+function gitMaintenanceState(repo, commonDir = join(repo, '.git')) {
+  const packDir = join(commonDir, 'objects', 'pack');
   const packs = existsSync(packDir) ? readdirSync(packDir).filter((n) => n.endsWith('.pack')).map((n) => ({ mtimeMs: statSync(join(packDir, n)).mtimeMs })) : [];
   const midx = lstatOrNull(join(packDir, 'multi-pack-index'));
   const timers = ['hourly', 'daily', 'weekly'].map((s) => {
@@ -258,7 +259,7 @@ export function runningAppServerHomes(proc = '/proc', defaultHome = join(homedir
 const timerDir = () => join(homedir(), '.config', 'systemd', 'user');
 
 // CH-14: the schedule runs an installed copy, so a checkout change (clean, submodule update) cannot remove it.
-const INSTALLED = ['package.json', 'src/codex-home.mjs', 'src/thread-provider.mjs', 'scripts/codex-home.mjs'];
+const INSTALLED = ['package.json', 'src/git-maintenance-hold.mjs', 'src/codex-home.mjs', 'src/thread-provider.mjs', 'scripts/codex-home.mjs'];
 export function installedPaths(record) {
   return { script: join(record.installDir, 'scripts', 'codex-home.mjs'), parameters: join(record.installDir, 'codex-home.json') };
 }
@@ -418,12 +419,28 @@ export async function observe(record, { script, parameters }) {
   } catch (error) { add('CH-4 thread query', false, `unknown; no copy or retry: ${error.message}`); }
 
   for (const ws of record.workspaces ?? []) {
-    const ex = readText(join(ws.path, '.git', 'info', 'exclude'));
-    add(`CH-6 workspace ${ws.path}`, mergeManagedBlock(ex, ws.excludes).changed === false, `exclude block ${ws.excludes.join(' ')}`);
-    if (ws.gitMaintenance) {
-      const m = gitMaintenanceState(ws.path);
-      add(`CH-15 git maintenance ${ws.path}`, m.timersEnabled && m.uncoveredPacks <= (ws.maxUncoveredPacks ?? 10),
-        `timers ${m.timers.join(' ')}; ${m.uncoveredPacks} of ${m.packs} packs newer than the multi-pack index`);
+    let identity;
+    try {
+      identity = receiveWorkspaceGit(ws.path);
+      const ex = readText(join(identity.commonDir, 'info', 'exclude'));
+      add(`CH-6 workspace ${ws.path}`, mergeManagedBlock(ex, ws.excludes).changed === false, `exclude block ${ws.excludes.join(' ')}`);
+    } catch (error) {
+      add(`CH-6 workspace ${ws.path}`, false, `native Git identity unknown: ${error.message}`);
+      if (ws.gitMaintenance === false) add(`CH-15 git maintenance ${ws.path}`, false, 'hold not received; native workspace observation refused');
+      continue;
+    }
+    try {
+      if (ws.gitMaintenance === false) {
+        const held = gitMaintenanceHoldState(identity);
+        add(`CH-15 git maintenance ${ws.path}`, held.held,
+          `selected registration ${held.registered ? 'present' : 'absent'}; local auto=${held.localAuto ?? 'unset'} gc=${held.localGc ?? 'unset'}; effective auto=${held.effectiveAuto ?? 'unset'} gc=${held.effectiveGc ?? 'unset'}; ${held.held ? 'held' : 'hold not received'}; running/manual work not cancelled`);
+      } else if (ws.gitMaintenance === true) {
+        const m = gitMaintenanceState(ws.path, identity.commonDir);
+        add(`CH-15 git maintenance ${ws.path}`, m.timersEnabled && m.uncoveredPacks <= (ws.maxUncoveredPacks ?? 10),
+          `timers ${m.timers.join(' ')}; ${m.uncoveredPacks} of ${m.packs} packs newer than the multi-pack index`);
+      }
+    } catch (error) {
+      add(`CH-15 git maintenance ${ws.path}`, false, `native maintenance state unknown; hold not received: ${error.message}`);
     }
   }
 
@@ -640,12 +657,19 @@ export async function applyScopes(record, scope, { script, parameters }, ports =
 
     async workspace() {
       for (const ws of record.workspaces ?? []) {
-        const p = join(ws.path, '.git', 'info', 'exclude');
+        const identity = receiveWorkspaceGit(ws.path);
+        if (ws.gitMaintenance === false) {
+          const held = applyGitMaintenanceHold(identity);
+          for (const changed of held.changed) log.push(`git ${changed} ${identity.path}`);
+          notes.push(`git maintenance held ${identity.path}: selected registration absent, local/effective auto=false gc=0; running/manual work not cancelled`);
+        }
+        recheckWorkspaceGit(identity);
+        const p = join(identity.commonDir, 'info', 'exclude');
         writeIfChanged(p, mergeManagedBlock(readText(p), ws.excludes).text, log);
-        if (ws.gitMaintenance) {
-          const m = gitMaintenanceState(ws.path);
-          if (!m.timersEnabled) { execFileSync('git', ['-C', ws.path, 'maintenance', 'start'], { stdio: 'ignore', env: userManagerEnv() }); log.push(`git maintenance start ${ws.path}`); }
-          if (m.uncoveredPacks > (ws.maxUncoveredPacks ?? 10)) { execFileSync('git', ['-C', ws.path, 'multi-pack-index', 'write'], { stdio: 'ignore' }); log.push(`multi-pack-index write ${ws.path} (${m.uncoveredPacks} packs were uncovered)`); }
+        if (ws.gitMaintenance === true) {
+          const m = gitMaintenanceState(ws.path, identity.commonDir);
+          if (!m.timersEnabled) { runWorkspaceGit(identity, ['maintenance', 'start'], userManagerEnv()); log.push(`git maintenance start ${ws.path}`); }
+          if (m.uncoveredPacks > (ws.maxUncoveredPacks ?? 10)) { runWorkspaceGit(identity, ['multi-pack-index', 'write']); log.push(`multi-pack-index write ${ws.path} (${m.uncoveredPacks} packs were uncovered)`); }
         }
       }
     },
