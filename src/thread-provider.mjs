@@ -4,15 +4,15 @@ import { createInterface } from 'node:readline';
 
 export const THREAD_SOURCES = Object.freeze(['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown']);
 
-/** One finite provider connection, no model turn, history load, storage fallback or retry. */
+/** One provider connection, no model turn, history load, storage fallback or retry. Every request is bounded
+ * by its own deadline and output budget, so the session's length follows the work, not a fixed allowance. */
 export async function withThreadProvider({ binary, home, timeoutMs = 5000, maximumBytes = 2 * 1024 * 1024 }, operation) {
   if (typeof binary !== 'string' || !binary.startsWith('/') || typeof home !== 'string' || !home.startsWith('/')) throw new Error('exact native Codex binary and home required');
   const child = spawn(binary, ['app-server', '--listen', 'stdio://'], { cwd: home, env: { ...process.env, CODEX_HOME: home }, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
   const pending = new Map();
   let sequence = 0, bytes = 0, failed;
   const kill = () => { try { if (child.pid && process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL'); else child.kill('SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } };
-  const stop = error => { failed ??= error; for (const entry of pending.values()) entry.reject(error); pending.clear(); kill(); };
-  const deadline = setTimeout(() => stop(new Error('native thread provider exceeded its deadline during ' + [...pending.values()].map(entry => entry.method).join(', '))), timeoutMs);
+  const stop = error => { failed ??= error; for (const entry of pending.values()) { clearTimeout(entry.deadline); entry.reject(error); } pending.clear(); kill(); };
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const closed = new Promise(resolve => child.once('close', resolve));
   child.on('error', error => stop(error));
@@ -30,7 +30,7 @@ export async function withThreadProvider({ binary, home, timeoutMs = 5000, maxim
       }
       const entry = pending.get(message.id);
       if (!entry) return;
-      pending.delete(message.id);
+      pending.delete(message.id); clearTimeout(entry.deadline); bytes = 0;
       if (message.error) entry.reject(new Error(`native ${entry.method} refused (${message.error.code})`));
       else entry.resolve(message.result);
     } catch (error) { stop(error); }
@@ -38,7 +38,7 @@ export async function withThreadProvider({ binary, home, timeoutMs = 5000, maxim
   const request = (method, params) => {
     if (!['initialize', 'thread/list', 'thread/archive'].includes(method)) return Promise.reject(new Error('unsupported native thread operation'));
     if (failed) return Promise.reject(failed);
-    return new Promise((resolve, reject) => { const id = sequence++; pending.set(id, { method, resolve, reject }); try { send({ id, method, params }); } catch (error) { pending.delete(id); reject(error); } });
+    return new Promise((resolve, reject) => { const id = sequence++; pending.set(id, { method, resolve, reject, deadline: setTimeout(() => stop(new Error(`native thread provider exceeded its deadline during ${method}`)), timeoutMs) }); try { send({ id, method, params }); } catch (error) { clearTimeout(pending.get(id)?.deadline); pending.delete(id); reject(error); } });
   };
   try {
     await request('initialize', { clientInfo: { name: 'codex-home-service', title: 'Codex home service', version: '1.0.0' } });
@@ -47,7 +47,7 @@ export async function withThreadProvider({ binary, home, timeoutMs = 5000, maxim
   } finally {
     lines.close(); child.stdin.end();
     const reap = setTimeout(kill, 100);
-    await closed; clearTimeout(reap); clearTimeout(deadline);
+    await closed; clearTimeout(reap);
   }
 }
 
