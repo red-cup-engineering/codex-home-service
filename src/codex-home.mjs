@@ -401,6 +401,8 @@ export async function observe(record, { script, parameters }) {
       const results = await reconcileHarnessResources(record, { dryRun: true });
       for (const result of results) add(`CH-26 harness ${result.workspace}`, result.written.length === 0,
         `${result.written.length ? `drift: ${result.written.join(', ')}` : 'source references current'}; active session enforcement unverified${result.codexTrustRequired ? '; Codex trust remains provider-owned' : ''}`);
+      for (const result of results) for (const context of result.context ?? []) add(`CH-CONTEXT ${context.provider} ${result.workspace}`, !context.changed,
+        `${context.changed ? 'context source registration drift' : 'context source references current'}; running-session uptake unverified${context.provider === 'codex' ? '; Codex trust remains provider-owned' : ''}`);
       const containment = results.find(result => result.containment)?.containment;
       if (containment) add('CH-27 harness containment', !containment.changed,
         `shared work-slice declaration ${containment.workUnit}; active provider enforcement remains unverified`);
@@ -500,9 +502,18 @@ export async function reconcileHarnessResources(record, { dryRun = false } = {})
   for (const workspace of selected.workspaces) {
     if (typeof workspace.path !== 'string' || !workspace.path.startsWith('/') || !workspace.providers?.length || workspace.providers.some(p => !['claude', 'codex'].includes(p))) throw new Error('invalid harness resource workspace');
   }
+  let contextInstaller;
+  if (selected.houseContextInstaller !== undefined) {
+    if (typeof selected.houseContextInstaller !== 'string' || !selected.houseContextInstaller.startsWith('/')) throw new Error('harnessResources houseContextInstaller needs its absolute owning source');
+    contextInstaller = (await import(pathToFileURL(selected.houseContextInstaller).href)).installHouseContextHook;
+    if (typeof contextInstaller !== 'function') throw new Error('selected context installer lacks its native install operation');
+  }
   const { writeHostResourceControl } = await import(pathToFileURL(selected.source).href);
   const results = selected.workspaces.map(workspace => ({ workspace: workspace.path,
-    ...writeHostResourceControl({ node: workspace.path, providers: workspace.providers, retiredSources: selected.retiredSources ?? [], dryRun }) }));
+    ...writeHostResourceControl({ node: workspace.path, providers: workspace.providers, retiredSources: selected.retiredSources ?? [], dryRun }),
+    ...(contextInstaller === undefined ? {} : { context: workspace.providers.map(provider => ({ provider,
+      ...contextInstaller({ settings: join(workspace.path, provider === 'codex' ? '.codex/hooks.json' : '.claude/settings.local.json'), trees: [workspace.path], node: record.node ?? process.execPath, dryRun }) })) }),
+  }));
   if (selected.containmentInstaller && results.length) {
     if (typeof selected.containmentInstaller !== 'string' || !selected.containmentInstaller.startsWith('/')) throw new Error('harnessResources containmentInstaller needs its absolute owning source');
     const { installContainment } = await import(pathToFileURL(selected.containmentInstaller).href);
@@ -606,6 +617,7 @@ export async function applyScopes(record, scope, { script, parameters }, ports =
     async harness() {
       for (const result of await reconcileHarnessResources(record)) {
         for (const file of result.written) log.push(`harness source reference ${join(result.workspace, file)}`);
+        for (const context of result.context ?? []) if (context.changed) log.push(`harness context source reference ${context.settings}`);
         if (result.containment?.changed) log.push(`harness containment reconciled ${result.containment.workUnit}`);
       }
     },

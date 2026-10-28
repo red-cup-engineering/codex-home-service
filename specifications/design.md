@@ -1,5 +1,9 @@
 # Codex home service: design
 
+## Shared context registration
+
+The existing `harness` scope receives an optional absolute `harnessResources.houseContextInstaller`. It imports that source's `installHouseContextHook` once, before workspace effects, then calls it for the existing workspace/provider pairs: `.codex/hooks.json` and `.claude/settings.local.json`. Each invocation selects only that workspace as its tree and uses the record's Node executable. The installer's existing merge, exact-source reference, backup, dry-run and idempotency behavior remain authoritative. No context text is copied. Health and apply expose the returned context changes separately; the hourly harness scope keeps those references current without another timer. Source registration never attests that Codex trusted the hook or that an already-running session consumed it. Native hook protocol and trust boundary: https://learn.chatgpt.com/docs/hooks.
+
 ## Scheduled execution receiving (CH-36)
 
 The existing health plan reads only seven named fields from the original

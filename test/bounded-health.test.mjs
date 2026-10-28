@@ -51,3 +51,23 @@ test('the existing timer reconciles selected provider registrations without chan
  const units=renderTimerUnits(record,'/installed/service','/record');
  assert.match(units.service,/--scope=retention,scratch,harness /);assert.match(units.timer,/OnCalendar=hourly/);
 });
+
+test('the original context installer reaches both providers through record-owned reconciliation', async t => {
+ const root=fixture(t),source=fileURLToPath(new URL('../../../../../src/host-resource-hook.mjs',import.meta.url));
+ const houseContextInstaller=fileURLToPath(new URL('../../../../../scripts/install-house-context-hook.mjs',import.meta.url));
+ const record={node:process.execPath,harnessResources:{source,houseContextInstaller,workspaces:[{path:root,providers:['claude','codex']}]}};
+ const planned=await reconcileHarnessResources(record,{dryRun:true});
+ assert.equal(planned[0].context.length,2);assert.ok(planned[0].context.every(c=>c.changed));
+ assert.equal(fs.existsSync(join(root,'.codex')),false);assert.equal(fs.existsSync(join(root,'.claude')),false);
+ await reconcileHarnessResources(record);
+ for(const file of ['.codex/hooks.json','.claude/settings.local.json']){
+  const context=JSON.parse(fs.readFileSync(join(root,file),'utf8'));
+  assert.ok(context.hooks.PreToolUse.length>0);
+  for(const event of ['SessionStart','SubagentStart','UserPromptSubmit'])assert.ok(context.hooks[event].some(group=>group.hooks.some(h=>h.command.includes('house-context-hook.mjs'))));
+ }
+ assert.ok((await reconcileHarnessResources(record,{dryRun:true}))[0].context.every(c=>!c.changed));
+ assert.equal((await reconcileHarnessResources(record,{dryRun:true}))[0].activeSessionGuarded,false);
+ const refused=fixture(t);
+ await assert.rejects(reconcileHarnessResources({harnessResources:{source,houseContextInstaller:'relative.mjs',workspaces:[{path:refused,providers:['codex']}]}}),/absolute owning source/);
+ assert.equal(fs.existsSync(join(refused,'.codex')),false);
+});
