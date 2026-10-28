@@ -1,5 +1,14 @@
 # Codex home service: requirements
 
+## Shared session context receiving
+
+- CH-CONTEXT-1. When `harnessResources.houseContextInstaller` names the shared source-owned context installer, the harness scope shall reconcile its SessionStart, SubagentStart and UserPromptSubmit references for each declared workspace/provider through that installer.
+- CH-CONTEXT-2. The health plan shall report context-registration drift separately from resource-controller drift and actual provider trust or running-session uptake.
+- CH-CONTEXT-3. Context reconciliation shall preserve unrelated settings, hooks, workspace scope and the existing timer cadence.
+- CH-CONTEXT-4. A dry run shall create no context settings or backup files.
+
+Leader, 2026-10-28, chat `01a18356-13bd-70e2-ace4-858e874da223`, requests repair of recurring wrong work and costs throughout the Codex harness and upstream. The original context installer already supports explicit settings and the three common events. Bare Cedar Fog's Codex project registers only the resource hook, so the existing shared context producer never reaches that provider. This is receiving of an existing producer, without a new scheduler, copied rules, permission grant or provider trust assertion.
+
 Leader statements taken as theory (2026-10-14):
 
 - "WE CANNOT KEEP CROSSING THE WSL WINDOWS LINE PUT ALL SHIT ON ONE SIDE OF IT PERMANENTLY ONE TIME MIGRATION RIGHT NOW AND MAKE IT BASICALLY IMPOSSIBLE TO SET IT BACK"
