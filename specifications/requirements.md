@@ -69,9 +69,9 @@ Each requirement has one shall. Identifiers are stable.
 - CH-14. The service shall run its schedule from a copy of itself and its record installed outside any git working tree, and `plan` shall report drift when that copy differs from the source, so that a checkout change (clean, submodule update, branch switch) cannot silently remove the scheduled job.
 - CH-22. The service shall reach the user's service manager the way its own timer does, supplying the manager's runtime directory when the calling shell has none, so that `plan` never reports a running timer as disabled. Measured 2026-10-19: from a `wsl.exe` shell `systemctl --user` found no bus, and `plan` reported the retention timer and git maintenance disabled; both had run that day.
 
-## Receiving conditions
+- CH-37. Health observation and retention apply shall skip native provider startup only when every file in their existing searched-file observation has age at most `min(retention.idleDays, 1)` days, reporting the usual empty archive/legacy selections and an apply no-eligible-files note without requiring a Codex binary. Any older candidate retains the complete native metadata/archive boundary and its unknown-provider failure state; a recent-file observation grants no thread or storage authority.
 
-- CH-37. Retention apply shall skip native provider startup when its existing searched-file observation contains no file older than either selector's minimum age: `min(retention.idleDays, 1)` days. It shall report that nothing is eligible without requiring a Codex binary. Any older candidate shall retain the complete native metadata/archive boundary before archive or legacy movement; a recent-file observation grants no thread or storage authority.
+## Receiving conditions
 
 1. `plan` exits 0 on a converged host and 2 on drift, naming the items.
 2. `apply` run twice changes nothing the second time.

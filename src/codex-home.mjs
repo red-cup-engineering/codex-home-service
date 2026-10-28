@@ -122,6 +122,10 @@ export function selectLegacy(files, referenced, nowMs) {
   return files.filter((f) => !referenced.has(f.path) && nowMs - f.mtimeMs > DAY_MS);
 }
 
+function canSkipThreadProvider(files, nowMs, idleDays) {
+  return files.every((file) => nowMs - file.mtimeMs <= Math.min(idleDays * DAY_MS, DAY_MS));
+}
+
 export function renderTimerUnits(record, script, parameters) {
   const r = record.retention;
   const scopes = ['retention', ...(record.scratch ? ['scratch'] : []), ...(record.harnessResources ? ['harness'] : [])].join(',');
@@ -427,7 +431,8 @@ export async function observe(record, { script, parameters }) {
   const total = files.reduce((s, f) => s + f.size, 0);
   add('CH-4 searched size', total <= record.retention.searchedSoftLimitBytes, `${MB(total)} in ${files.length} files (limit ${MB(record.retention.searchedSoftLimitBytes)})`);
   try {
-    const threads = await readThreads(record.home, { binary: codexBinary(record.codexBinaryGlob), files });
+    const threads = canSkipThreadProvider(files, now, record.retention.idleDays) ? []
+      : await readThreads(record.home, { binary: codexBinary(record.codexBinaryGlob), files });
     const toArchive = selectRetention(threads, byPath, now, record.retention.idleDays);
     add('CH-4 retention', toArchive.length === 0, `${toArchive.length} threads idle > ${record.retention.idleDays} d, ${MB(toArchive.reduce((s, t) => s + t.bytes, 0))}`);
     const legacy = selectLegacy(files, new Set(threads.map((t) => t.rollout_path)), now);
@@ -648,8 +653,7 @@ export async function applyScopes(record, scope, { script, parameters }, ports =
     async retention() {
       const now = Date.now();
       const files = sessionFiles(record.home);
-      const candidateAge = Math.min(record.retention.idleDays * DAY_MS, DAY_MS);
-      if (files.every((file) => now - file.mtimeMs <= candidateAge)) {
+      if (canSkipThreadProvider(files, now, record.retention.idleDays)) {
         notes.push('retention: no session file is old enough for archive or legacy selection; native thread provider not started');
         return;
       }
