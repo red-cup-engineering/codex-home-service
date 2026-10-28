@@ -648,6 +648,11 @@ export async function applyScopes(record, scope, { script, parameters }, ports =
     async retention() {
       const now = Date.now();
       const files = sessionFiles(record.home);
+      const candidateAge = Math.min(record.retention.idleDays * DAY_MS, DAY_MS);
+      if (files.every((file) => now - file.mtimeMs <= candidateAge)) {
+        notes.push('retention: no session file is old enough for archive or legacy selection; native thread provider not started');
+        return;
+      }
       const byPath = new Map(files.map((f) => [f.path, f]));
       const bin = codexBinary(record.codexBinaryGlob);
       await withThreadProvider({ binary: bin, home: record.home }, async request => {

@@ -109,6 +109,8 @@ Shared work containment uses the destination user manager's effective memory all
 
 ### Independent scopes (CH-32)
 
+Retention first compares the already-observed session-file mtimes with the smaller of the archive idle interval and the legacy selector's one day. If every file is at or below that age, including an empty searched folder, neither existing selector can return work: apply records a no-eligible-files note before binary discovery or native provider startup. Any older file keeps the original provider protocol and both selectors unchanged, even when the archive interval is longer than one day. This avoids an unnecessary native process for an age-ineligible observation; it does not replace provider authority or establish measured runtime savings before operating receiving (CH-37).
+
 `apply` splits into one function per scope, run in the listed order (harness, placement, retention, scratch, workspace, config, timer). After the record-level refusals, a scope that throws is logged as `FAILED <scope>: <message>` and the next scope runs; `applyScopes` returns `{ log, notes, failures }` (`notes` is what was seen and left, such as the scratch kept-and-why summary, and is not a change), `apply` keeps returning the log and throws `ApplyFailed` carrying log and failures, and the command exits 1. The retention scope depends on a provider binary on the Windows drive that sometimes does not answer in time; it must not decide whether scratch is expired.
 
 ### Retiring on an event (CH-35)
