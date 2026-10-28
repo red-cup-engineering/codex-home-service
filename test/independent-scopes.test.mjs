@@ -18,6 +18,11 @@ const idleEntry = (dir, name) => { const p = join(dir, name); fs.mkdirSync(p, { 
 function failingRetention(root) {
   const scratch = join(root, 'scratch');
   fs.mkdirSync(scratch, { recursive: true });
+  const sessions = join(root, 'home', 'sessions');
+  fs.mkdirSync(sessions, { recursive: true });
+  const rollout = join(sessions, 'old-rollout.jsonl');
+  fs.writeFileSync(rollout, '{}\n');
+  fs.utimesSync(rollout, old, old);
   return {
     schema: 'codex-home-parameters@1', home: join(root, 'home'), windowsProfileCodexDir: root, shellRc: join(root, 'profile'),
     installDir: join(root, 'install'), node: process.execPath, codexBinaryGlob: join(root, 'no-binary', '*', 'codex'),

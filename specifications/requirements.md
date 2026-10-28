@@ -71,6 +71,8 @@ Each requirement has one shall. Identifiers are stable.
 
 ## Receiving conditions
 
+- CH-37. Retention apply shall skip native provider startup when its existing searched-file observation contains no file older than either selector's minimum age: `min(retention.idleDays, 1)` days. It shall report that nothing is eligible without requiring a Codex binary. Any older candidate shall retain the complete native metadata/archive boundary before archive or legacy movement; a recent-file observation grants no thread or storage authority.
+
 1. `plan` exits 0 on a converged host and 2 on drift, naming the items.
 2. `apply` run twice changes nothing the second time.
 3. After apply, Codex's own search command over the searched folder completes in seconds, measured.
