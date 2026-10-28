@@ -25,6 +25,46 @@ test('health observes declared scratch policy without opening its unreadable roo
  assert.match(items.find(i=>i.id.includes('CH-16')).detail,/not inspected by health plan/);
 });
 
+function retentionHealthFixture(t, idleDays) {
+ const root=fixture(t),profile=join(root,'profile');fs.writeFileSync(profile,'');
+ const record={home:root,windowsProfileCodexDir:root,shellRc:profile,installDir:join(root,'install'),node:process.execPath,
+  codexBinaryGlob:join(root,'no-binary','*','codex'),retention:{idleDays,searchedSoftLimitBytes:100,onCalendar:'hourly',onBootDelay:'15min'}};
+ const context={script:fileURLToPath(new URL('../scripts/codex-home.mjs',import.meta.url)),parameters:join(root,'record.json')};
+ fs.writeFileSync(context.parameters,JSON.stringify(record));
+ return {root,record,context};
+}
+
+test('empty and recent health observations report empty selections without a Codex binary',async t=>{
+ const now=Date.UTC(2026,9,28,12);t.mock.method(Date,'now',()=>now);
+ for(const idleDays of [2,0.25]){
+  const f=retentionHealthFixture(t,idleDays);
+  for(const state of ['empty','recent']){
+   if(state==='recent'){
+    fs.mkdirSync(join(f.root,'sessions'));const file=join(f.root,'sessions','recent.jsonl');fs.writeFileSync(file,'{}\n');
+    const mtime=new Date(now-Math.min(idleDays,1)*86400000);fs.utimesSync(file,mtime,mtime);
+   }
+   const items=await observe(f.record,f.context);
+   assert.equal(items.some(item=>item.id==='CH-4 thread query'),false);
+   const retention=items.find(item=>item.id==='CH-4 retention'),legacy=items.find(item=>item.id==='CH-5 legacy');
+   assert.equal(retention.status,'current');assert.match(retention.detail,/^0 threads idle/);
+   assert.equal(legacy.status,'current');assert.match(legacy.detail,/^0 unreferenced files/);
+  }
+ }
+});
+
+test('an age-eligible health observation still requires native metadata and preserves unknown',async t=>{
+ const now=Date.UTC(2026,9,28,12);t.mock.method(Date,'now',()=>now);
+ for(const [idleDays,ageDays] of [[2,3],[7,1.5],[0.25,0.5]]){
+  const f=retentionHealthFixture(t,idleDays);fs.mkdirSync(join(f.root,'sessions'));
+  const file=join(f.root,'sessions','old.jsonl');fs.writeFileSync(file,'{}\n');
+  const mtime=new Date(now-ageDays*86400000);fs.utimesSync(file,mtime,mtime);
+  const items=await observe(f.record,f.context),query=items.find(item=>item.id==='CH-4 thread query');
+  assert.equal(query.status,'drift');assert.match(query.detail,/unknown; no copy or retry: exact native Codex binary and home required/);
+  assert.equal(items.some(item=>item.id==='CH-4 retention'||item.id==='CH-5 legacy'),false);
+  assert.equal(fs.readFileSync(file,'utf8'),'{}\n');
+ }
+});
+
 test('record-owned harness apply selects the common controller and dry-run creates no provider files',async t=>{
  const root=fixture(t),source=fileURLToPath(new URL('../../../../../src/host-resource-hook.mjs',import.meta.url));
  const record={harnessResources:{source,workspaces:[{path:root,providers:['claude','codex']}]}};
