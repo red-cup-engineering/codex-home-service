@@ -1,10 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { readThreads, reconcileHarnessResources, observe, renderTimerUnits } from '../src/codex-home.mjs';
-import { fileURLToPath } from 'node:url';
+
+function harnessSource(file) {
+  const configured = process.env.CODEX_HOME_HARNESS_ROOT;
+  if (configured !== undefined) {
+    if (!isAbsolute(configured)) throw new Error('CODEX_HOME_HARNESS_ROOT must be absolute');
+    return join(configured, file);
+  }
+
+  let root = process.cwd();
+  while (root) {
+    try {
+      root = execFileSync('git', ['-C', root, 'rev-parse', '--show-superproject-working-tree'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch {
+      break;
+    }
+    if (root && fs.existsSync(join(root, file))) return join(root, file);
+  }
+  throw new Error('Run inside the Agent Harness workspace or set CODEX_HOME_HARNESS_ROOT to its source checkout');
+}
 
 function fixture(t) { const p=fs.mkdtempSync(join(tmpdir(),'health-read-')); t.after(()=>{const scratch=join(p,'scratch');if(fs.existsSync(scratch))fs.chmodSync(scratch,0o700);fs.rmSync(p,{recursive:true,force:true})}); return p; }
 test('thread metadata uses the native provider and resolves omitted paths from the existing finite listing',async()=>{
@@ -66,7 +88,7 @@ test('an age-eligible health observation still requires native metadata and pres
 });
 
 test('record-owned harness apply selects the common controller and dry-run creates no provider files',async t=>{
- const root=fixture(t),source=fileURLToPath(new URL('../../../../../src/host-resource-hook.mjs',import.meta.url));
+ const root=fixture(t),source=harnessSource('src/host-resource-hook.mjs');
  const record={harnessResources:{source,workspaces:[{path:root,providers:['claude','codex']}]}};
  const planned=await reconcileHarnessResources(record,{dryRun:true});assert.equal(planned[0].written.length,3);assert.equal(fs.existsSync(join(root,'.claude')),false);
  const changed=await reconcileHarnessResources(record);assert.equal(changed[0].activeSessionGuarded,false);assert.equal(changed[0].codexTrustRequired,true);
@@ -75,7 +97,7 @@ test('record-owned harness apply selects the common controller and dry-run creat
 
 
 test('the owning record selects containment installation and keeps dry-run free of effects',async t=>{
- const root=fixture(t),source=fileURLToPath(new URL('../../../../../src/host-resource-hook.mjs',import.meta.url));
+ const root=fixture(t),source=harnessSource('src/host-resource-hook.mjs');
  const installer=join(root,'selected-installer.mjs'),effect=join(root,'native-containment-received');
  fs.writeFileSync(installer,`import{writeFileSync}from'node:fs';export function installContainment({dryRun}){if(!dryRun)writeFileSync(${JSON.stringify(effect)},'received');return{changed:dryRun,workUnit:${JSON.stringify(join(root,'agent-work.slice'))},reloaded:!dryRun}}`);
  const record={harnessResources:{source,containmentInstaller:installer,workspaces:[{path:root,providers:['claude','codex']}]}};
@@ -93,8 +115,8 @@ test('the existing timer reconciles selected provider registrations without chan
 });
 
 test('the original context installer reaches both providers through record-owned reconciliation', async t => {
- const root=fixture(t),source=fileURLToPath(new URL('../../../../../src/host-resource-hook.mjs',import.meta.url));
- const houseContextInstaller=fileURLToPath(new URL('../../../../../scripts/install-house-context-hook.mjs',import.meta.url));
+ const root=fixture(t),source=harnessSource('src/host-resource-hook.mjs');
+ const houseContextInstaller=harnessSource('scripts/install-house-context-hook.mjs');
  const record={node:process.execPath,harnessResources:{source,houseContextInstaller,workspaces:[{path:root,providers:['claude','codex']}]}};
  const planned=await reconcileHarnessResources(record,{dryRun:true});
  assert.equal(planned[0].context.length,2);assert.ok(planned[0].context.every(c=>c.changed));
